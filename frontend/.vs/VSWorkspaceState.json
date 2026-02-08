@@ -1,0 +1,15 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\src",
+    "\\src\\assets",
+    "\\src\\components",
+    "\\src\\hooks",
+    "\\src\\layouts",
+    "\\src\\pages",
+    "\\src\\stores",
+    "\\src\\types",
+    "\\src\\utils"
+  ],
+  "PreviewInSolutionExplorer": false
+}

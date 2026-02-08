@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 主题：默认主色（由 JS 根据用户选择覆盖） */
+:root {
+  --primary-50: #eff6ff;
+  --primary-100: #dbeafe;
+  --primary-500: #3b82f6;
+  --primary-600: #2563eb;
+}
+
+/* 响应式与移动端基础 */
+@layer base {
+  html {
+    min-height: 100%;
+    min-height: 100dvh;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    min-height: 100%;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    touch-action: manipulation;
+  }
+}
+
+/* 隐藏横向滚动条（保留滚动） */
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+}
