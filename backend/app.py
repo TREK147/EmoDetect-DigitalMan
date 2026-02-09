@@ -1,17 +1,32 @@
 """
-后端 API：为 frontend 提供 AI 对话、注册登录等接口。
+后端 API：为 frontend 提供 AI 对话、注册登录、文件上传等接口。
 """
+import base64
+import json
+import os
 import secrets
+import uuid
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
-from config import AUTODL_URL, API_KEY, CHAT_MODEL, MAX_TOKENS
+from config import CHAT_API_URL, API_KEY, CHAT_MODEL, MAX_TOKENS
 import database as db
 
 app = Flask(__name__)
 CORS(app, origins=["*"])
+
+# 上传目录（相对 backend 的上级目录下的 uploads）
+UPLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads"))
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# 允许的扩展名
+ALLOWED_IMAGE = {"jpg", "jpeg", "png", "gif", "webp"}
+ALLOWED_VIDEO = {"mp4", "mov", "webm"}
+ALLOWED_AUDIO = {"webm", "mp3", "wav", "ogg", "m4a"}
+ALLOWED_EXT = ALLOWED_IMAGE | ALLOWED_VIDEO | ALLOWED_AUDIO | {"pdf", "doc", "docx", "txt"}
 
 # 启动时尝试创建 users 表（若 DB 不可用，注册时再报错）
 try:
@@ -46,32 +61,120 @@ def _require_auth():
     return user_id, None
 
 
-def build_messages(history: list, content: str) -> list:
-    """将前端传来的历史 + 当前用户消息转为 OpenAPI messages 格式。"""
+def build_messages(history: list, content: str, image_base64: str = None, image_mime: str = None) -> list:
+    """
+    将历史 + 当前用户消息转为 OpenAPI messages 格式。
+    若 image_base64 存在，最后一条为多模态 content 数组（文本 + 图片）。
+    """
     messages = []
     for item in history or []:
         role = item.get("role", "user")
         if role not in ("user", "assistant", "system"):
             role = "user"
         messages.append({"role": role, "content": (item.get("content") or "").strip()})
-    messages.append({"role": "user", "content": content.strip()})
+
+    text = (content or "").strip()
+    if image_base64:
+        mime = image_mime or "image/jpeg"
+        data_url = f"data:{mime};base64,{image_base64}"
+        parts = []
+        if text:
+            parts.append({"type": "text", "text": text})
+        parts.append({"type": "image_url", "image_url": {"url": data_url}})
+        messages.append({"role": "user", "content": parts})
+    else:
+        if not text:
+            text = "（无文字内容）"
+        messages.append({"role": "user", "content": text})
     return messages
+
+
+def _resolve_image_from_request(data: dict):
+    """从请求中解析出 image_base64 与 image_mime。支持 imageBase64 或 imageUrl（本地上传路径）。"""
+    b64 = data.get("imageBase64") or data.get("image_base64")
+    if b64:
+        return b64, (data.get("imageMime") or data.get("image_mime") or "image/jpeg")
+    url = data.get("imageUrl") or data.get("image_url")
+    if url and isinstance(url, str) and "/api/uploads/" in url:
+        try:
+            rel = url.split("/api/uploads/", 1)[-1].lstrip("/")
+            if ".." in rel or not rel:
+                return None, None
+            path = os.path.join(UPLOAD_DIR, rel)
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                ext = os.path.splitext(path)[1].lower()
+                mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
+                return b64, mime
+        except Exception:
+            pass
+    return None, None
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    """上传文件，返回 { url, fileName, mimeType, category }。category: image|video|file|voice。"""
+    if "file" not in request.files:
+        return jsonify({"error": "未选择文件"}), 400
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"error": "无效文件"}), 400
+    ext = (f.filename.rsplit(".", 1)[-1] or "").lower()
+    if ext not in ALLOWED_EXT:
+        return jsonify({"error": f"不支持的文件类型: {ext}"}), 400
+    name = secure_filename(f.filename) or "file"
+    if "." not in name:
+        name = f"{name}.{ext}"
+    sub = uuid.uuid4().hex[:8]
+    save_dir = os.path.join(UPLOAD_DIR, sub)
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, name)
+    f.save(save_path)
+    rel = f"{sub}/{name}"
+    url = f"/api/uploads/{rel}"
+    if ext in ALLOWED_IMAGE:
+        category = "image"
+    elif ext in ALLOWED_VIDEO:
+        category = "video"
+    elif ext in ALLOWED_AUDIO:
+        category = "voice"
+    else:
+        category = "file"
+    mime = f.content_type or "application/octet-stream"
+    return jsonify({"url": url, "fileName": name, "mimeType": mime, "category": category})
+
+
+@app.route("/api/uploads/<path:rel>", methods=["GET"])
+def serve_upload(rel):
+    """提供上传文件的访问。"""
+    if ".." in rel:
+        return jsonify({"error": "非法路径"}), 400
+    path = os.path.join(UPLOAD_DIR, rel)
+    if not os.path.isfile(path):
+        return jsonify({"error": "文件不存在"}), 404
+    return send_from_directory(UPLOAD_DIR, rel, as_attachment=False)
 
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
     """
-    请求体: { "content": "用户输入", "messages": [ { "role": "user"|"assistant", "content": "..." } ] }
+    请求体: { "content": "用户输入", "messages": [...], 可选 "imageBase64"/"imageUrl", "attachmentHint" }
     响应:   { "content": "AI 回复文本" }
     """
     try:
         data = request.get_json(force=True, silent=True) or {}
         content = (data.get("content") or "").strip()
-        if not content:
-            return jsonify({"error": "content 不能为空"}), 400
-
+        attachment_hint = (data.get("attachmentHint") or data.get("attachment_hint") or "").strip()
+        if not content and not attachment_hint:
+            image_b64, _ = _resolve_image_from_request(data)
+            if not image_b64:
+                return jsonify({"error": "content 或附件不能为空"}), 400
+        if attachment_hint and not content:
+            content = attachment_hint
+        image_b64, image_mime = _resolve_image_from_request(data)
         history = data.get("messages") or []
-        messages = build_messages(history, content)
+        messages = build_messages(history, content, image_b64, image_mime)
 
         payload = {
             "model": CHAT_MODEL,
@@ -83,7 +186,7 @@ def chat():
             "Authorization": f"Bearer {API_KEY}",
         }
 
-        resp = requests.post(AUTODL_URL, json=payload, headers=headers, timeout=60)
+        resp = requests.post(CHAT_API_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         result = resp.json()
         ai_content = (
@@ -99,6 +202,80 @@ def chat():
             except Exception:
                 err_msg = e.response.text or err_msg
         return jsonify({"error": f"模型请求失败: {err_msg}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chat/stream", methods=["POST"])
+def chat_stream():
+    """
+    流式对话：请求体同 /api/chat，支持 content、imageBase64/imageUrl、attachmentHint。
+    响应为 SSE 流，每行 data: {"content": "增量文本"}\n\n，结束为 data: [DONE]\n\n
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        content = (data.get("content") or "").strip()
+        attachment_hint = (data.get("attachmentHint") or data.get("attachment_hint") or "").strip()
+        image_b64, image_mime = _resolve_image_from_request(data)
+        if not content and not attachment_hint and not image_b64:
+            return jsonify({"error": "content 或附件不能为空"}), 400
+        if attachment_hint and not content:
+            content = attachment_hint
+        history = data.get("messages") or []
+        messages = build_messages(history, content, image_b64, image_mime)
+        payload = {
+            "model": CHAT_MODEL,
+            "messages": messages,
+            "max_tokens": MAX_TOKENS,
+            "stream": True,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+        }
+
+        def generate():
+            try:
+                resp = requests.post(
+                    CHAT_API_URL, json=payload, headers=headers, timeout=60, stream=True
+                )
+                resp.raise_for_status()
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or not line.strip():
+                        continue
+                    raw = line[6:].strip() if line.startswith("data: ") else line.strip()
+                    if raw == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        return
+                    try:
+                        obj = json.loads(raw)
+                        delta = (
+                            obj.get("choices", [{}])[0]
+                            .get("delta", {})
+                            .get("content", "")
+                        )
+                        if delta:
+                            yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
+                    except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+                        pass
+            except requests.RequestException as e:
+                err = str(e)
+                if hasattr(e, "response") and e.response is not None:
+                    try:
+                        err = e.response.json().get("error", {}).get("message", err)
+                    except Exception:
+                        err = e.response.text or err
+                yield f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
