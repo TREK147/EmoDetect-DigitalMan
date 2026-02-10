@@ -21,6 +21,8 @@ function getCopyContent(message: Message): string {
   if (message.type === 'text') return message.content
   if (message.type === 'file' && message.fileName) return message.fileName
   if (message.type === 'image' && message.fileUrl) return message.fileUrl
+  if (message.type === 'video' && message.fileUrl) return message.fileUrl
+  if (message.type === 'voice' && message.fileUrl) return message.fileUrl
   return message.content
 }
 
@@ -65,15 +67,15 @@ export default function MessageBubble({ message, fileSize }: MessageBubbleProps)
 
           {message.type === 'image' && (
             <div className="space-y-2">
-              {(message.fileUrl || message.content) ? (
+              {message.fileUrl ? (
                 <a
-                  href={message.fileUrl || message.content}
+                  href={message.fileUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="block rounded-lg overflow-hidden max-w-full border border-white/20"
                 >
                   <img
-                    src={message.fileUrl || message.content}
+                    src={message.fileUrl}
                     alt={message.content || '图片'}
                     loading="lazy"
                     decoding="async"
@@ -86,10 +88,26 @@ export default function MessageBubble({ message, fileSize }: MessageBubbleProps)
                   <span>图片消息</span>
                 </div>
               )}
-              {message.content && !message.fileUrl && (
-                <p className="whitespace-pre-wrap text-xs opacity-90 mt-1">
+              {message.content && (
+                <p className="whitespace-pre-wrap text-sm opacity-90 mt-1">
                   {message.content}
                 </p>
+              )}
+            </div>
+          )}
+
+          {message.type === 'video' && (
+            <div className="space-y-2">
+              {message.fileUrl ? (
+                <video
+                  src={message.fileUrl}
+                  controls
+                  className="max-w-full max-h-64 rounded-lg border border-gray-200 dark:border-gray-600"
+                  preload="metadata"
+                />
+              ) : null}
+              {message.fileName && (
+                <p className="text-xs opacity-80 truncate">{message.fileName}</p>
               )}
             </div>
           )}
@@ -122,9 +140,22 @@ export default function MessageBubble({ message, fileSize }: MessageBubbleProps)
           )}
 
           {message.type === 'voice' && (
-            <div className="flex items-center gap-2 py-1">
-              <span className="opacity-80">🎤 语音消息</span>
-              {message.content && (
+            <div className="flex flex-col gap-2 py-1">
+              <div className="flex items-center gap-2">
+                <span className="opacity-80">🎤 语音消息</span>
+                {message.fileName && (
+                  <span className="text-xs opacity-70 truncate">{message.fileName}</span>
+                )}
+              </div>
+              {message.fileUrl && (
+                <audio
+                  src={message.fileUrl}
+                  controls
+                  className="max-w-full h-8"
+                  preload="metadata"
+                />
+              )}
+              {message.content && !message.fileUrl && (
                 <span className="text-xs opacity-70">({message.content})</span>
               )}
             </div>

@@ -10,7 +10,7 @@ export interface Message {
   content: string;
   sender: 'user' | 'ai';
   timestamp: Date;
-  type: 'text' | 'image' | 'file' | 'voice';
+  type: 'text' | 'image' | 'file' | 'voice' | 'video';
   fileUrl?: string;
   fileName?: string;
 }
@@ -21,4 +21,5 @@ export interface Conversation {
   lastMessage: string;
   updatedAt: Date;
   messageCount: number;
+  pinned?: boolean;
 }

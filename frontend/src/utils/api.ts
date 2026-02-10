@@ -356,3 +356,123 @@ export async function sendMessageStreamWithRetry(
   }
   throw lastError
 }
+
+// ---------- 5. AI 对话（对接 backend /api/chat，转发 AutoDL） ----------
+
+export interface ChatHistoryItem {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface ChatResponse {
+  content: string
+}
+
+/** 上传文件，返回 url、fileName、category（image|video|file|voice） */
+export interface UploadResult {
+  url: string
+  fileName: string
+  mimeType: string
+  category: 'image' | 'video' | 'file' | 'voice'
+}
+
+export async function uploadFile(file: File): Promise<UploadResult> {
+  const form = new FormData()
+  form.append('file', file)
+  const token = getStoredToken()
+  const res = await fetch(`${BASE_URL}/upload`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: form,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `上传失败: ${res.status}`,
+      res.status
+    )
+  }
+  return res.json()
+}
+
+/** 发送一条用户消息，携带可选历史，获取 AI 回复 */
+export async function chatWithAI(
+  content: string,
+  history?: ChatHistoryItem[]
+): Promise<ChatResponse> {
+  const res = await client.post<ChatResponse>('/chat', { content, messages: history ?? [] })
+  return res.data
+}
+
+export interface ChatStreamOptions {
+  imageUrl?: string
+  attachmentHint?: string
+}
+
+/** 流式对话：通过 onChunk 逐块接收 AI 回复内容。支持图片（imageUrl）和视频/语音描述（attachmentHint）。 */
+export async function chatWithAIStream(
+  content: string,
+  onChunk: (chunk: string) => void,
+  history?: ChatHistoryItem[],
+  options?: ChatStreamOptions
+): Promise<void> {
+  const token = getStoredToken()
+  const url = `${BASE_URL}/chat/stream`
+  const body: Record<string, unknown> = {
+    content: content || undefined,
+    messages: history ?? [],
+  }
+  if (options?.imageUrl) body.imageUrl = options.imageUrl
+  if (options?.attachmentHint) body.attachmentHint = options.attachmentHint
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `请求失败: ${res.status}`,
+      res.status
+    )
+  }
+  const reader = res.body?.getReader()
+  if (!reader) return
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        const raw = line.slice(6).trim()
+        if (raw === '[DONE]') return
+        try {
+          const data = JSON.parse(raw) as { content?: string; error?: string }
+          if (data.error) throw new ApiError(data.error, 500)
+          if (data.content) onChunk(data.content)
+        } catch (e) {
+          if (e instanceof ApiError) throw e
+        }
+      }
+    }
+  }
+  if (buffer.startsWith('data: ')) {
+    const raw = buffer.slice(6).trim()
+    if (raw !== '[DONE]') {
+      try {
+        const data = JSON.parse(raw) as { content?: string; error?: string }
+        if (data.error) throw new ApiError(data.error, 500)
+        if (data.content) onChunk(data.content)
+      } catch (e) {
+        if (e instanceof ApiError) throw e
+      }
+    }
+  }
+}

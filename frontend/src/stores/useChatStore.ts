@@ -5,6 +5,9 @@ interface ChatState {
   // ---------- 用户状态 ----------
   user: User | null
   setUser: (user: User | null) => void
+  /** 是否正在根据 token 恢复用户（未完成前不判定为未登录） */
+  authRestoring: boolean
+  setAuthRestoring: (v: boolean) => void
   logout: () => void
   isLoggedIn: () => boolean
 
@@ -21,6 +24,7 @@ interface ChatState {
   setCurrentConversationId: (id: string | null) => void
   setMessages: (messages: Message[]) => void
   addMessage: (message: Message) => void
+  updateMessage: (id: string, patch: Partial<Message>) => void
   clearMessages: () => void
 
   // ---------- UI 状态 ----------
@@ -33,6 +37,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 用户状态
   user: null,
   setUser: (user) => set({ user }),
+  authRestoring: false,
+  setAuthRestoring: (v) => set({ authRestoring: v }),
   logout: () =>
     set({
       user: null,
@@ -68,6 +74,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setMessages: (messages) => set({ messages }),
   addMessage: (message) =>
     set((s) => ({ messages: [...s.messages, message] })),
+  updateMessage: (id, patch) =>
+    set((s) => ({
+      messages: s.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
+    })),
   clearMessages: () => set({ messages: [] }),
 
   // UI 状态

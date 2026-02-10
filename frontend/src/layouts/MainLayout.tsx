@@ -43,7 +43,6 @@ export default function MainLayout() {
   return (
     <div className="flex flex-col h-screen min-h-[100dvh] max-h-[100dvh] overflow-hidden pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
       <Header
-        onMenuClick={() => setSidebarOpen(true)}
         user={user}
         onSettingsClick={() => setSettingsOpen(true)}
         onNotificationClick={() => setNotificationOpen(true)}
@@ -89,13 +88,18 @@ export default function MainLayout() {
           currentConversationId={currentConversationId}
           onNewConversation={handleNewConversation}
           onSelectConversation={handleSelectConversation}
+          onRemoveConversation={(id) => useChatStore.getState().removeConversation(id)}
+          onUpdateConversation={(id, patch) => useChatStore.getState().updateConversation(id, patch)}
           isOpen={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
           onOpen={() => setSidebarOpen(true)}
         />
 
-        {/* 主内容区域 */}
-        <main className="flex-1 flex flex-col min-w-0 bg-white dark:bg-gray-900 overflow-hidden">
+        {/* 主内容区域（左侧条 56px 常驻，展开面板时 56+280px） */}
+        <main
+          className="flex-1 flex flex-col min-w-0 bg-white dark:bg-gray-900 overflow-hidden transition-[padding-left] duration-200 ease-out"
+          style={{ paddingLeft: sidebarOpen ? 336 : 56 }}
+        >
           <Outlet />
         </main>
       </div>

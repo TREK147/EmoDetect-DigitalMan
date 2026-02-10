@@ -1,18 +1,5 @@
 import { useState, useRef, useCallback } from 'react'
-import {
-  Send,
-  Paperclip,
-  Mic,
-  Square,
-  Smile,
-  Bold,
-  Italic,
-  Code,
-  List,
-  Quote,
-  Heading2,
-  Link as LinkIcon,
-} from 'lucide-react'
+import { Send, Paperclip, Mic, Square, Smile } from 'lucide-react'
 import clsx from 'clsx'
 
 const DEFAULT_ROWS = 2
@@ -25,24 +12,10 @@ const EMOJI_LIST = [
   '🔥', '⭐', '✨', '💯', '✅', '❌', '📌', '💡', '🎉', '🚀',
 ]
 
-const MARKDOWN_SHORTCUTS: Array<
-  | { icon: typeof Bold; wrap: string; title: string }
-  | { icon: typeof Heading2; prefix: string; title: string }
-  | { icon: typeof LinkIcon; replace: (s: string) => string; insertWhenEmpty: string; title: string }
-> = [
-  { icon: Bold, wrap: '**', title: '粗体' },
-  { icon: Italic, wrap: '*', title: '斜体' },
-  { icon: Code, wrap: '`', title: '行内代码' },
-  { icon: Heading2, prefix: '## ', title: '标题' },
-  { icon: List, prefix: '- ', title: '列表' },
-  { icon: Quote, prefix: '> ', title: '引用' },
-  {
-    icon: LinkIcon,
-    replace: (s) => `[${s}]()`,
-    insertWhenEmpty: '[]()',
-    title: '链接',
-  },
-]
+interface PendingImage {
+  url: string
+  fileName?: string
+}
 
 interface InputAreaProps {
   value: string
@@ -51,6 +24,8 @@ interface InputAreaProps {
   onFileSelect?: (files: File[]) => void
   onVoiceRecordStart?: () => void
   onVoiceRecordStop?: () => void
+  /** 待发送的图片（有图时无文字也可发送） */
+  pendingImage?: PendingImage | null
   placeholder?: string
   disabled?: boolean
 }
@@ -62,6 +37,7 @@ export default function InputArea({
   onFileSelect,
   onVoiceRecordStart,
   onVoiceRecordStop,
+  pendingImage = null,
   placeholder = '输入消息...',
   disabled = false,
 }: InputAreaProps) {
@@ -69,10 +45,11 @@ export default function InputArea({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [emojiOpen, setEmojiOpen] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
+  const canSubmit = value.trim() || pendingImage != null
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!value.trim() || disabled) return
+    if (!canSubmit || disabled) return
     onSubmit()
   }
 
@@ -90,27 +67,6 @@ export default function InputArea({
       el.setSelectionRange(pos, pos)
     })
   }, [onChange])
-
-  const insertMarkdown = useCallback((item: (typeof MARKDOWN_SHORTCUTS)[number]) => {
-    const el = textareaRef.current
-    if (!el) return
-    const start = el.selectionStart
-    const end = el.selectionEnd
-    const selected = el.value.slice(start, end)
-
-    if ('replace' in item) {
-      const toInsert = selected ? item.replace(selected) : item.insertWhenEmpty ?? ''
-      if (toInsert) insertAtCursor(toInsert, '')
-      return
-    }
-    if ('wrap' in item && item.wrap) {
-      insertAtCursor(item.wrap, item.wrap)
-      return
-    }
-    if ('prefix' in item && item.prefix) {
-      insertAtCursor(item.prefix, '')
-    }
-  }, [insertAtCursor])
 
   const insertEmoji = useCallback((emoji: string) => {
     insertAtCursor(emoji, '')
@@ -136,22 +92,7 @@ export default function InputArea({
 
   return (
     <div className="border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 p-2 sm:p-3 md:p-3">
-      {/* Markdown 快捷输入工具栏：小屏可横向滚动 */}
-      <div className="flex items-center gap-0.5 sm:gap-1 pb-1.5 sm:pb-2 border-b border-gray-100 dark:border-gray-800 overflow-x-auto scrollbar-hide">
-        {MARKDOWN_SHORTCUTS.map((item) => (
-          <button
-            key={item.title}
-            type="button"
-            onClick={() => insertMarkdown(item)}
-            title={item.title}
-            className="p-1.5 rounded text-gray-500 hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-300 touch-manipulation shrink-0"
-          >
-            <item.icon className="w-4 h-4" />
-          </button>
-        ))}
-      </div>
-
-      <form onSubmit={handleSubmit} className="flex gap-1.5 sm:gap-2 pt-2 sm:pt-3">
+      <form onSubmit={handleSubmit} className="flex gap-1.5 sm:gap-2 pt-1 sm:pt-2">
         {/* 左侧：附件、表情 */}
         <div className="flex items-center gap-0.5 sm:gap-1 flex-shrink-0">
           <input
@@ -261,7 +202,7 @@ export default function InputArea({
           </button>
           <button
             type="submit"
-            disabled={!value.trim() || disabled}
+            disabled={!canSubmit || disabled}
             className="p-2.5 sm:p-3 rounded-lg sm:rounded-xl bg-primary-500 text-white hover:bg-primary-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors touch-manipulation min-w-[44px] min-h-[44px] flex items-center justify-center active:scale-95"
             aria-label="发送"
           >

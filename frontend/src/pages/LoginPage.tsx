@@ -1,16 +1,7 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useChatStore } from '@/stores/useChatStore'
-import { login as loginApi, setStoredToken } from '@/utils/api'
-import type { User } from '@/types'
-
-/** 无后端时使用：用表单数据生成演示用户并进入聊天 */
-function demoLogin(email: string, setUser: (u: User | null) => void, navigate: (to: string, opts?: { replace?: boolean }) => void) {
-  const username = email.split('@')[0]?.trim() || '演示用户'
-  setUser({ id: 'demo-1', username, email })
-  setStoredToken('demo-token')
-  navigate('/chat', { replace: true })
-}
+import { login as loginApi, ApiError } from '@/utils/api'
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -28,8 +19,8 @@ export default function LoginPage() {
       const res = await loginApi({ email, password })
       setUser(res.user)
       navigate('/chat', { replace: true })
-    } catch {
-      demoLogin(email, setUser, navigate)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '登录失败，请稍后重试')
     } finally {
       setLoading(false)
     }

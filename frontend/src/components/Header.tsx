@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { setStoredToken } from '@/utils/api'
+import { setStoredToken, logout as logoutApi } from '@/utils/api'
 import {
   Menu,
   Sun,
@@ -53,11 +53,15 @@ export default function Header({
   const { mode, resolvedTheme, primaryColor, setMode, setPrimaryColor } =
     useThemeStore()
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setUserMenuOpen(false)
-    setStoredToken(null)
-    logout()
-    navigate('/login', { replace: true })
+    try {
+      await logoutApi()
+    } finally {
+      setStoredToken(null)
+      logout()
+      navigate('/login', { replace: true })
+    }
   }
 
   useEffect(() => {
@@ -87,12 +91,6 @@ export default function Header({
             <Menu className="w-5 h-5 sm:w-5 sm:h-5" />
           </button>
         )}
-        <Link
-          to="/"
-          className="text-base sm:text-lg font-semibold text-gray-800 dark:text-white truncate"
-        >
-          智慧星
-        </Link>
       </div>
 
       <nav className="flex items-center gap-1 sm:gap-2">

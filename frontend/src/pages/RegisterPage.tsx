@@ -1,24 +1,7 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useChatStore } from '@/stores/useChatStore'
-import { register as registerApi, setStoredToken } from '@/utils/api'
-import type { User } from '@/types'
-
-/** 无后端时使用：用表单数据生成演示用户并进入聊天 */
-function demoRegister(
-  username: string,
-  email: string,
-  setUser: (u: User | null) => void,
-  navigate: (to: string, opts?: { replace?: boolean }) => void
-) {
-  setUser({
-    id: 'demo-1',
-    username: username.trim(),
-    email: email.trim(),
-  })
-  setStoredToken('demo-token')
-  navigate('/chat', { replace: true })
-}
+import { register as registerApi, ApiError } from '@/utils/api'
 
 export default function RegisterPage() {
   const [username, setUsername] = useState('')
@@ -52,8 +35,8 @@ export default function RegisterPage() {
       const res = await registerApi({ username: username.trim(), email: email.trim(), password })
       setUser(res.user)
       navigate('/chat', { replace: true })
-    } catch {
-      demoRegister(username, email, setUser, navigate)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '注册失败，请稍后重试')
     } finally {
       setLoading(false)
     }
