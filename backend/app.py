@@ -215,14 +215,147 @@ def chat():
         return jsonify({"error": str(e)}), 500
 
 
+def _conv_row_to_json(row):
+    """会话行转前端格式。"""
+    if not row:
+        return None
+    return {
+        "id": str(row["id"]),
+        "title": row.get("title") or "新对话",
+        "lastMessage": (row.get("last_message") or "").strip(),
+        "updatedAt": row["updated_at"].isoformat() if hasattr(row.get("updated_at"), "isoformat") else str(row.get("updated_at", "")),
+        "messageCount": int(row.get("message_count", 0)),
+        "pinned": bool(row.get("pinned")),
+    }
+
+
+def _msg_row_to_json(row):
+    """消息行转前端格式：role assistant -> sender ai。"""
+    if not row:
+        return None
+    role = (row.get("role") or "user").strip()
+    return {
+        "id": str(row["id"]),
+        "content": (row.get("content") or "").strip(),
+        "sender": "ai" if role == "assistant" else "user",
+        "timestamp": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
+        "type": (row.get("type") or "text").strip(),
+        "fileUrl": (row.get("file_url") or "").strip() or None,
+        "fileName": (row.get("file_name") or "").strip() or None,
+    }
+
+
+@app.route("/api/conversations", methods=["GET"])
+def list_conversations():
+    """当前用户的会话列表，需登录。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        limit = request.args.get("limit", type=int) or 200
+        limit = min(max(1, limit), 500)
+        rows = db.get_conversations_by_user(int(user_id), limit=limit)
+        return jsonify([_conv_row_to_json(r) for r in rows])
+    except Exception as e:
+        return _err("查询失败: " + str(e), 500)
+
+
+@app.route("/api/conversations", methods=["POST"])
+def create_conversation():
+    """创建会话，需登录。body: { title? }"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        title = (data.get("title") or "新对话").strip()[:255]
+        conv_id = db.create_conversation(int(user_id), title)
+        row = db.get_conversation_by_id(conv_id, int(user_id))
+        return jsonify(_conv_row_to_json(row))
+    except Exception as e:
+        return _err("创建失败: " + str(e), 500)
+
+
+@app.route("/api/conversations/<int:conv_id>", methods=["GET"])
+def get_conversation(conv_id):
+    """获取单条会话，需登录且为本人。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    row = db.get_conversation_by_id(conv_id, int(user_id))
+    if not row:
+        return _err("会话不存在", 404)
+    return jsonify(_conv_row_to_json(row))
+
+
+@app.route("/api/conversations/<int:conv_id>", methods=["PATCH"])
+def patch_conversation(conv_id):
+    """更新会话 title / pinned，需登录且为本人。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    title = data.get("title")
+    pinned = data.get("pinned")
+    if title is None and pinned is None:
+        return jsonify(_conv_row_to_json(db.get_conversation_by_id(conv_id, int(user_id))))
+    ok = db.update_conversation(conv_id, int(user_id), title=title, pinned=pinned)
+    if not ok:
+        return _err("会话不存在", 404)
+    row = db.get_conversation_by_id(conv_id, int(user_id))
+    return jsonify(_conv_row_to_json(row))
+
+
+@app.route("/api/conversations/<int:conv_id>", methods=["DELETE"])
+def delete_conversation(conv_id):
+    """删除会话，需登录且为本人。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    ok = db.delete_conversation(conv_id, int(user_id))
+    if not ok:
+        return _err("会话不存在", 404)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/conversations/<int:conv_id>/messages", methods=["GET"])
+def list_messages(conv_id):
+    """会话消息列表，需登录且为本人。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    conv = db.get_conversation_by_id(conv_id, int(user_id))
+    if not conv:
+        return _err("会话不存在", 404)
+    limit = request.args.get("limit", type=int) or 500
+    limit = min(max(1, limit), 1000)
+    rows = db.get_messages_by_conversation(conv_id, limit=limit)
+    return jsonify([_msg_row_to_json(r) for r in rows])
+
+
 @app.route("/api/chat/stream", methods=["POST"])
 def chat_stream():
     """
-    流式对话：请求体同 /api/chat，支持 content、imageBase64/imageUrl、attachmentHint。
-    响应为 SSE 流，每行 data: {"content": "增量文本"}\n\n，结束为 data: [DONE]\n\n
+    流式对话：需登录。请求体需含 conversationId；支持 content、imageUrl、attachmentHint。
+    会将会话与消息写入数据库，历史从数据库读取。
+    响应为 SSE：data: {"content": "增量文本"}，结束 data: [DONE] 或 data: {"type":"done"}。
     """
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
     try:
         data = request.get_json(force=True, silent=True) or {}
+        conv_id_raw = data.get("conversationId") or data.get("conversation_id")
+        if conv_id_raw is None:
+            return jsonify({"error": "缺少 conversationId"}), 400
+        try:
+            conv_id = int(conv_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "conversationId 无效"}), 400
+        owner = db.get_conversation_owner(conv_id)
+        if owner is None or owner != int(user_id):
+            return jsonify({"error": "会话不存在或无权访问"}), 404
+
         content = (data.get("content") or "").strip()
         attachment_hint = (data.get("attachmentHint") or data.get("attachment_hint") or "").strip()
         image_b64, image_mime = _resolve_image_from_request(data)
@@ -230,11 +363,24 @@ def chat_stream():
             return jsonify({"error": "content 或附件不能为空"}), 400
         if attachment_hint and not content:
             content = attachment_hint
-        history = data.get("messages") or []
-        messages = build_messages(history, content, image_b64, image_mime)
+
+        # 从数据库取历史（仅文本，用于上下文）
+        history_rows = db.get_messages_by_conversation(conv_id, limit=50)
+        history = []
+        for r in history_rows:
+            role = (r.get("role") or "user").strip()
+            if role in ("user", "assistant"):
+                history.append({"role": role, "content": (r.get("content") or "").strip()})
+        messages_for_ai = build_messages(history, content, image_b64, image_mime)
+
+        # 写入用户消息
+        user_content = content or (attachment_hint or "[图片/附件]")
+        user_msg_id = db.create_message(conv_id, "user", user_content, "text", None, None)
+        db.update_conversation_last_message(conv_id, user_content)
+
         payload = {
             "model": CHAT_MODEL,
-            "messages": messages,
+            "messages": messages_for_ai,
             "max_tokens": MAX_TOKENS,
             "stream": True,
         }
@@ -244,6 +390,7 @@ def chat_stream():
         }
 
         def generate():
+            full_content = []
             try:
                 resp = requests.post(
                     CHAT_API_URL, json=payload, headers=headers, timeout=60, stream=True
@@ -254,8 +401,7 @@ def chat_stream():
                         continue
                     raw = line[6:].strip() if line.startswith("data: ") else line.strip()
                     if raw == "[DONE]":
-                        yield "data: [DONE]\n\n"
-                        return
+                        break
                     try:
                         obj = json.loads(raw)
                         delta = (
@@ -264,16 +410,22 @@ def chat_stream():
                             .get("content", "")
                         )
                         if delta:
+                            full_content.append(delta)
                             yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
                     except (json.JSONDecodeError, IndexError, KeyError, TypeError):
                         pass
+                # 流结束后写入 assistant 消息并更新会话摘要
+                ai_content = "".join(full_content).strip() or "（无回复）"
+                db.create_message(conv_id, "assistant", ai_content, "text", None, None)
+                db.update_conversation_last_message(conv_id, ai_content)
+                yield "data: [DONE]\n\n"
             except requests.RequestException as e:
                 err = str(e)
                 if hasattr(e, "response") and e.response is not None:
                     try:
-                        err = e.response.json().get("error", {}).get("message", err)
+                        err = (e.response.json() or {}).get("error", {}).get("message", err)
                     except Exception:
-                        err = e.response.text or err
+                        err = getattr(e.response, "text", None) or err
                 yield f"data: {json.dumps({'error': err}, ensure_ascii=False)}\n\n"
 
         return Response(

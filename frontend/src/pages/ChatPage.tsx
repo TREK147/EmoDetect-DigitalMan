@@ -7,8 +7,7 @@ import VirtualMessageList from '@/components/VirtualMessageList'
 import { useChatStore } from '@/stores/useChatStore'
 import { useToastStore } from '@/stores/useToastStore'
 import { useVoiceRecorder } from '@/hooks/useVoiceRecorder'
-import { saveMessages } from '@/utils/chatStorage'
-import { chatWithAIStream, uploadFile, ApiError, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_LABEL } from '@/utils/api'
+import { chatWithAIStream, uploadFile, ApiError, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_LABEL, createConversation, invalidateConversationMessages } from '@/utils/api'
 
 /** 超过此条数启用虚拟滚动 */
 const VIRTUAL_SCROLL_THRESHOLD = 30
@@ -51,12 +50,7 @@ export default function ChatPage() {
 
   const useVirtualScroll = messages.length >= VIRTUAL_SCROLL_THRESHOLD
 
-  // 当前会话消息变更时持久化到本地，便于刷新后在历史记录中恢复
-  useEffect(() => {
-    if (currentConversationId && messages.length >= 0) {
-      saveMessages(userId, currentConversationId, messages)
-    }
-  }, [userId, currentConversationId, messages])
+  // 消息已由服务端持久化，无需再写 localStorage
 
   useEffect(() => {
     if (!useVirtualScroll && messages.length > 0) {
@@ -82,7 +76,7 @@ export default function ChatPage() {
       const file = new File([voiceToSend.blob], voiceToSend.fileName, {
         type: voiceToSend.blob.type || 'audio/webm',
       })
-      const convId = ensureConversation()
+      const convId = await ensureConversation()
       setIsAiLoading(true)
       const aiMsgId = generateId()
       try {
@@ -106,23 +100,17 @@ export default function ChatPage() {
           type: 'text',
         })
         updateConversation(convId, { lastMessage: userMsg.content, updatedAt: new Date(), messageCount: messages.length + 1 })
-        const history = messages
-          .slice(-20)
-          .filter((m) => m.type === 'text')
-          .map((m) => ({
-            role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
-            content: m.content,
-          }))
         const hint = `用户发送了一条语音，文件名：${name}，请简单回复。`
         await chatWithAIStream(
+          convId,
           hint,
           (chunk) => {
             const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
             updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
           },
-          history,
           { attachmentHint: hint }
         )
+        invalidateConversationMessages(convId)
       } catch (err) {
         const msg =
           err instanceof ApiError
@@ -144,32 +132,12 @@ export default function ChatPage() {
     }
 
     const displayContent = content || '请描述或分析这张图片'
-    let convId = currentConversationId
-    if (!convId) {
-      const title = (content || pendingImage?.fileName || '图片').slice(0, 20) + ((content || pendingImage?.fileName || '').length > 20 ? '…' : '')
-      const conv = {
-        id: `conv-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-        title,
-        lastMessage: displayContent,
-        updatedAt: new Date(),
-        messageCount: 0,
-      }
-      addConversation(conv)
-      setCurrentConversationId(conv.id)
-      convId = conv.id
-      updateConversation(conv.id, {
-        title: conv.title,
-        lastMessage: displayContent,
-        updatedAt: conv.updatedAt,
-        messageCount: 1,
-      })
-    } else {
-      updateConversation(convId, {
-        lastMessage: displayContent,
-        updatedAt: new Date(),
-        messageCount: messages.length + 1,
-      })
-    }
+    const convId = await ensureConversation()
+    updateConversation(convId, {
+      lastMessage: displayContent,
+      updatedAt: new Date(),
+      messageCount: messages.length + 1,
+    })
 
     const userMessage: Message = {
       id: generateId(),
@@ -195,22 +163,16 @@ export default function ChatPage() {
     })
 
     try {
-      const history = messages
-        .slice(-20)
-        .filter((m) => m.type === 'text')
-        .map((m) => ({
-          role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
-          content: m.content,
-        }))
-      await chatWithAIStream(
-        displayContent,
-        (chunk) => {
-          const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
-          updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
-        },
-        history,
-        hasImage && imageToSend ? { imageUrl: imageToSend.url } : undefined
+        await chatWithAIStream(
+          convId,
+          displayContent,
+          (chunk) => {
+            const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
+            updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
+          },
+          hasImage && imageToSend ? { imageUrl: imageToSend.url } : undefined
       )
+        invalidateConversationMessages(convId)
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'AI 回复失败，请稍后重试'
       toast(msg)
@@ -220,21 +182,13 @@ export default function ChatPage() {
     }
   }
 
-  const ensureConversation = (): string => {
-    let convId = currentConversationId
-    if (!convId) {
-      const conv = {
-        id: `conv-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-        title: '新对话',
-        lastMessage: '',
-        updatedAt: new Date(),
-        messageCount: 0,
-      }
-      addConversation(conv)
-      setCurrentConversationId(conv.id)
-      convId = conv.id
-    }
-    return convId
+  /** 确保当前有会话（无则服务端创建），返回会话 id。 */
+  const ensureConversation = async (): Promise<string> => {
+    if (currentConversationId) return currentConversationId
+    const conv = await createConversation({ title: '新对话' })
+    addConversation(conv)
+    setCurrentConversationId(conv.id)
+    return conv.id
   }
 
   const handleFileSelect = async (files: File[]) => {
@@ -255,7 +209,7 @@ export default function ChatPage() {
       }
       return
     }
-    const convId = ensureConversation()
+    const convId = await ensureConversation()
     const fileName = file.name || '未命名文件'
     setIsAiLoading(true)
     let msgType: Message['type'] = 'file'
@@ -288,26 +242,20 @@ export default function ChatPage() {
         timestamp: new Date(),
         type: 'text',
       })
-      const history = messages
-        .slice(-20)
-        .filter((m) => m.type === 'text')
-        .map((m) => ({
-          role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
-          content: m.content,
-        }))
       const content =
         msgType === 'voice'
           ? `用户发送了一条语音，文件名：${name}，请简单回复。`
           : `用户发送了一个${msgType === 'file' ? '文件' : '视频'}，文件名：${name}，请简单回复。`
       await chatWithAIStream(
+        convId,
         content,
         (chunk) => {
           const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
           updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
         },
-        history,
         { attachmentHint: content }
       )
+      invalidateConversationMessages(convId)
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : '上传或 AI 回复失败'
       toast(msg)

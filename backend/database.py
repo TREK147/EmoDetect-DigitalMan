@@ -134,10 +134,176 @@ def get_latest_emotion_label(user_id: int) -> Optional[dict]:
             return cur.fetchone()
 
 
+# ---------- 会话与消息（聊天记录持久化） ----------
+
+
+def create_conversations_table():
+    """创建 conversations 表，与 users.id 对应。"""
+    sql = """
+    CREATE TABLE IF NOT EXISTS conversations (
+      id            INT          NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+      user_id       INT          NOT NULL COMMENT '用户 id',
+      title         VARCHAR(255) NOT NULL DEFAULT '新对话' COMMENT '会话标题',
+      last_message  VARCHAR(500) NULL COMMENT '最后一条消息摘要',
+      pinned        TINYINT      NOT NULL DEFAULT 0 COMMENT '是否固定 0/1',
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      KEY idx_user_id (user_id),
+      KEY idx_user_updated (user_id, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户会话表'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def create_messages_table():
+    """创建 messages 表，与 conversations.id 对应。"""
+    sql = """
+    CREATE TABLE IF NOT EXISTS messages (
+      id              INT          NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '主键',
+      conversation_id INT          NOT NULL COMMENT '会话 id',
+      role            VARCHAR(20)  NOT NULL DEFAULT 'user' COMMENT 'user | assistant',
+      content         TEXT         NOT NULL COMMENT '消息内容',
+      type            VARCHAR(20)  NOT NULL DEFAULT 'text' COMMENT 'text|image|file|voice|video',
+      file_url        VARCHAR(500) NULL,
+      file_name       VARCHAR(255) NULL,
+      created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_conv_id (conversation_id),
+      KEY idx_conv_created (conversation_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会话消息表'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def create_conversation(user_id: int, title: str = "新对话") -> int:
+    """创建会话，返回 id。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO conversations (user_id, title) VALUES (%s, %s)",
+                (user_id, (title or "新对话").strip()[:255]),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def get_conversations_by_user(user_id: int, limit: int = 200) -> list:
+    """按 user_id 查询会话列表，按 updated_at 倒序。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.id, c.user_id, c.title, c.last_message AS last_message, c.pinned, c.created_at, c.updated_at,
+                          (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count
+                   FROM conversations c
+                   WHERE c.user_id = %s
+                   ORDER BY c.pinned DESC, c.updated_at DESC
+                   LIMIT %s""",
+                (user_id, max(1, limit)),
+            )
+            return cur.fetchall()
+
+
+def get_conversation_by_id(conv_id: int, user_id: int) -> Optional[dict]:
+    """查询单条会话，且需属于该 user_id。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, title, last_message, pinned, created_at, updated_at FROM conversations WHERE id = %s AND user_id = %s",
+                (conv_id, user_id),
+            )
+            return cur.fetchone()
+
+
+def update_conversation(conv_id: int, user_id: int, title: Optional[str] = None, pinned: Optional[int] = None, last_message: Optional[str] = None, updated_at=None) -> bool:
+    """更新会话（仅允许所属用户）。"""
+    updates = []
+    args = []
+    if title is not None:
+        updates.append("title = %s")
+        args.append((title or "").strip()[:255])
+    if pinned is not None:
+        updates.append("pinned = %s")
+        args.append(1 if pinned else 0)
+    if last_message is not None:
+        updates.append("last_message = %s")
+        args.append((last_message or "")[:500])
+    if not updates:
+        return True
+    args.extend([conv_id, user_id])
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE conversations SET " + ", ".join(updates) + " WHERE id = %s AND user_id = %s",
+                tuple(args),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def delete_conversation(conv_id: int, user_id: int) -> bool:
+    """删除会话及其消息（仅允许所属用户）。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM messages WHERE conversation_id = %s", (conv_id,))
+            cur.execute("DELETE FROM conversations WHERE id = %s AND user_id = %s", (conv_id, user_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def create_message(conversation_id: int, role: str, content: str, msg_type: str = "text", file_url: Optional[str] = None, file_name: Optional[str] = None) -> int:
+    """插入一条消息，返回 id。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO messages (conversation_id, role, content, type, file_url, file_name)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (conversation_id, (role or "user").strip(), (content or "").strip(), (msg_type or "text").strip(), file_url, file_name),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def update_conversation_last_message(conv_id: int, last_message: str) -> None:
+    """更新会话的 last_message 与 updated_at（由应用层在写入 message 后调用）。"""
+    msg_preview = (last_message or "").strip()[:500]
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE conversations SET last_message = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (msg_preview, conv_id))
+        conn.commit()
+
+
+def get_messages_by_conversation(conversation_id: int, limit: int = 500) -> list:
+    """按会话 id 查询消息列表，按 created_at 正序。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, conversation_id, role, content, type, file_url, file_name, created_at
+                   FROM messages WHERE conversation_id = %s ORDER BY created_at ASC LIMIT %s""",
+                (conversation_id, max(1, limit)),
+            )
+            return cur.fetchall()
+
+
+def get_conversation_owner(conversation_id: int) -> Optional[int]:
+    """返回会话所属 user_id，不存在则 None。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM conversations WHERE id = %s", (conversation_id,))
+            row = cur.fetchone()
+            return row["user_id"] if row else None
+
+
 def init_db():
     """初始化数据库（创建表等）。"""
     create_users_table()
     create_emotion_labels_table()
+    create_conversations_table()
+    create_messages_table()
 
 
 if __name__ == "__main__":

@@ -169,10 +169,25 @@ export async function getConversation(id: string): Promise<Conversation> {
   return normalized
 }
 
+export async function patchConversation(
+  id: string,
+  patch: { title?: string; pinned?: boolean }
+): Promise<Conversation> {
+  const res = await client.patch<Conversation>(`/conversations/${id}`, patch)
+  invalidateCache(/^GET:\/conversations:/)
+  invalidateCache(new RegExp(`/conversations/${id}`))
+  return normalizeConversation(res.data)
+}
+
 export async function deleteConversation(id: string): Promise<void> {
   await client.delete(`/conversations/${id}`)
   invalidateCache(/^GET:\/conversations:/)
   invalidateCache(new RegExp(`/conversations/${id}`))
+}
+
+/** 使某会话的消息列表缓存失效（发送新消息后调用，以便切换回时拉取最新） */
+export function invalidateConversationMessages(conversationId: string): void {
+  invalidateCache(new RegExp(`/conversations/${conversationId}/messages`))
 }
 
 function normalizeConversation(c: Conversation): Conversation {
@@ -428,18 +443,18 @@ export interface ChatStreamOptions {
   attachmentHint?: string
 }
 
-/** 流式对话：通过 onChunk 逐块接收 AI 回复内容。支持图片（imageUrl）和视频/语音描述（attachmentHint）。 */
+/** 流式对话：需登录，会话历史由服务端从数据库读取并持久化。通过 onChunk 逐块接收 AI 回复。支持图片（imageUrl）和视频/语音描述（attachmentHint）。 */
 export async function chatWithAIStream(
+  conversationId: string,
   content: string,
   onChunk: (chunk: string) => void,
-  history?: ChatHistoryItem[],
   options?: ChatStreamOptions
 ): Promise<void> {
   const token = getStoredToken()
   const url = `${BASE_URL}/chat/stream`
   const body: Record<string, unknown> = {
+    conversationId,
     content: content || undefined,
-    messages: history ?? [],
   }
   if (options?.imageUrl) body.imageUrl = options.imageUrl
   if (options?.attachmentHint) body.attachmentHint = options.attachmentHint

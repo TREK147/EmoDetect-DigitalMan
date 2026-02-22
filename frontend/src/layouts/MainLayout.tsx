@@ -4,18 +4,14 @@ import Sidebar from '@/components/Sidebar'
 import Header from '@/components/Header'
 import Toast from '@/components/Toast'
 import { useChatStore } from '@/stores/useChatStore'
-import type { Conversation } from '@/types'
 import {
-  loadConversations,
-  saveConversations,
-  loadMessages,
-  deleteMessagesForConversation,
-} from '@/utils/chatStorage'
+  getConversations,
+  createConversation,
+  getMessages,
+  deleteConversation,
+  patchConversation,
+} from '@/utils/api'
 import { X } from 'lucide-react'
-
-function generateId(): string {
-  return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
-}
 
 export default function MainLayout() {
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -31,48 +27,67 @@ export default function MainLayout() {
   const setMessages = useChatStore((s) => s.setMessages)
   const clearMessages = useChatStore((s) => s.clearMessages)
   const removeConversation = useChatStore((s) => s.removeConversation)
+  const updateConversation = useChatStore((s) => s.updateConversation)
 
-  const userId = user?.id ?? 'guest'
   const authRestoring = useChatStore((s) => s.authRestoring)
 
-  // 刷新或登录后：从本地恢复对话列表，当前界面视为“新聊天”（不恢复当前会话消息）；仅在校验完成后执行一次
+  // 登录/恢复后：从服务端拉取会话列表
   useEffect(() => {
-    if (authRestoring) return
-    const list = loadConversations(userId)
-    setConversations(list)
-    setCurrentConversationId(null)
-    clearMessages()
-    // 仅依赖 userId / authRestoring，避免每次 conversations 变化时重复清空
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, authRestoring])
+    if (authRestoring || !user) return
+    getConversations()
+      .then((list) => {
+        setConversations(list)
+        setCurrentConversationId(null)
+        clearMessages()
+      })
+      .catch(() => {
+        setConversations([])
+        setCurrentConversationId(null)
+        clearMessages()
+      })
+  }, [user?.id, authRestoring, setConversations, setCurrentConversationId, clearMessages])
 
-  // 对话列表变更时持久化
-  useEffect(() => {
-    saveConversations(userId, conversations)
-  }, [userId, conversations])
-
-  const handleNewConversation = () => {
-    const conv: Conversation = {
-      id: generateId(),
-      title: '新对话',
-      lastMessage: '',
-      updatedAt: new Date(),
-      messageCount: 0,
+  const handleNewConversation = async () => {
+    try {
+      const conv = await createConversation({ title: '新对话' })
+      addConversation(conv)
+      setCurrentConversationId(conv.id)
+      clearMessages()
+    } catch {
+      // 创建失败时仍可在前端新建本地会话，但无法持久化；这里简单清空当前
+      setCurrentConversationId(null)
+      clearMessages()
     }
-    addConversation(conv)
-    setCurrentConversationId(conv.id)
-    clearMessages()
   }
 
-  const handleSelectConversation = (id: string) => {
-    const messages = loadMessages(userId, id)
-    setMessages(messages)
+  const handleSelectConversation = async (id: string) => {
     setCurrentConversationId(id)
+    try {
+      const list = await getMessages(id)
+      setMessages(list)
+    } catch {
+      setMessages([])
+    }
   }
 
-  const handleRemoveConversation = (id: string) => {
-    removeConversation(id)
-    deleteMessagesForConversation(userId, id)
+  const handleRemoveConversation = async (id: string) => {
+    try {
+      await deleteConversation(id)
+      removeConversation(id)
+    } catch {
+      removeConversation(id)
+    }
+  }
+
+  const handleUpdateConversation = async (id: string, patch: { title?: string; lastMessage?: string; updatedAt?: Date; messageCount?: number; pinned?: boolean }) => {
+    updateConversation(id, patch)
+    if (patch.title !== undefined || patch.pinned !== undefined) {
+      try {
+        await patchConversation(id, { title: patch.title, pinned: patch.pinned })
+      } catch {
+        // 忽略
+      }
+    }
   }
 
   return (
@@ -124,7 +139,7 @@ export default function MainLayout() {
           onNewConversation={handleNewConversation}
           onSelectConversation={handleSelectConversation}
           onRemoveConversation={handleRemoveConversation}
-          onUpdateConversation={(id, patch) => useChatStore.getState().updateConversation(id, patch)}
+          onUpdateConversation={handleUpdateConversation}
           isOpen={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
           onOpen={() => setSidebarOpen(true)}
