@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react'
 import { Send, Paperclip, Mic, Square, Smile } from 'lucide-react'
 import clsx from 'clsx'
+import { MAX_FILE_SIZE_LABEL } from '@/utils/api'
 
 const DEFAULT_ROWS = 2
 const MAX_ROWS = 8
@@ -17,6 +18,11 @@ interface PendingImage {
   fileName?: string
 }
 
+interface PendingVoice {
+  url: string
+  fileName: string
+}
+
 interface InputAreaProps {
   value: string
   onChange: (value: string) => void
@@ -26,6 +32,8 @@ interface InputAreaProps {
   onVoiceRecordStop?: () => void
   /** 待发送的图片（有图时无文字也可发送） */
   pendingImage?: PendingImage | null
+  /** 待发送的语音（有语音时无文字也可发送） */
+  pendingVoice?: PendingVoice | null
   placeholder?: string
   disabled?: boolean
 }
@@ -38,6 +46,7 @@ export default function InputArea({
   onVoiceRecordStart,
   onVoiceRecordStop,
   pendingImage = null,
+  pendingVoice = null,
   placeholder = '输入消息...',
   disabled = false,
 }: InputAreaProps) {
@@ -45,7 +54,7 @@ export default function InputArea({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [emojiOpen, setEmojiOpen] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
-  const canSubmit = value.trim() || pendingImage != null
+  const canSubmit = value.trim() || pendingImage != null || pendingVoice != null
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -108,7 +117,7 @@ export default function InputArea({
             onClick={() => fileInputRef.current?.click()}
             disabled={disabled}
             className="p-2 sm:p-2.5 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 touch-manipulation min-w-[44px] min-h-[44px] flex items-center justify-center"
-            title="上传文件（图片、视频、文档）"
+            title={`上传文件（图片、视频、文档），单文件最大 ${MAX_FILE_SIZE_LABEL}`}
             aria-label="上传文件"
           >
             <Paperclip className="w-5 h-5" />

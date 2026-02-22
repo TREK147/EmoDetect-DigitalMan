@@ -7,6 +7,10 @@ const DEFAULT_TIMEOUT = 30000
 const MAX_RETRIES = 3
 const RETRY_DELAY_BASE = 1000
 
+/** 单文件上传最大大小（10MB），上传前校验，超过则提示并终止 */
+export const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+export const MAX_FILE_SIZE_LABEL = '10MB'
+
 /** 认证 token 存储 key */
 const TOKEN_KEY = 'auth_token'
 
@@ -376,23 +380,38 @@ export interface UploadResult {
   category: 'image' | 'video' | 'file' | 'voice'
 }
 
+const UPLOAD_TIMEOUT_MS = 60000
+
 export async function uploadFile(file: File): Promise<UploadResult> {
   const form = new FormData()
   form.append('file', file)
   const token = getStoredToken()
-  const res = await fetch(`${BASE_URL}/upload`, {
-    method: 'POST',
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-    body: form,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new ApiError(
-      (err as { error?: string }).error ?? `上传失败: ${res.status}`,
-      res.status
-    )
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${BASE_URL}/upload`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+      signal: controller.signal,
+    })
+    clearTimeout(timeoutId)
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new ApiError(
+        (err as { error?: string }).error ?? `上传失败: ${res.status}`,
+        res.status
+      )
+    }
+    return res.json()
+  } catch (e) {
+    clearTimeout(timeoutId)
+    if (e instanceof ApiError) throw e
+    if (e instanceof Error && e.name === 'AbortError') {
+      throw new ApiError('上传超时，请检查网络后重试')
+    }
+    throw new ApiError(e instanceof Error ? e.message : '上传失败，请重试')
   }
-  return res.json()
 }
 
 /** 发送一条用户消息，携带可选历史，获取 AI 回复 */

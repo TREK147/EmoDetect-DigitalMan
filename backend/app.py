@@ -9,14 +9,23 @@ import uuid
 import requests
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
 from config import CHAT_API_URL, API_KEY, CHAT_MODEL, MAX_TOKENS
 import database as db
 
+# 单文件上传最大 10MB，与前端一致；超过时请求被拒绝
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 CORS(app, origins=["*"])
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_too_large(e):
+    return jsonify({"error": f"文件过大，单文件最大支持 10MB"}), 413
 
 # 上传目录（相对 backend 的上级目录下的 uploads）
 UPLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads"))

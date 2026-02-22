@@ -282,6 +282,9 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
         return
       }
       const mr = mediaRecorderRef.current
+      try {
+        if (typeof mr.requestData === 'function') mr.requestData()
+      } catch (_) {}
       mr.onstop = () => {
         if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop())
         streamRef.current = null
@@ -295,17 +298,33 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
         if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current)
         setWaveformData(Array(WAVEFORM_LENGTH).fill(0))
         setAudioLevel(0)
-        const blob = chunksRef.current.length
-          ? new Blob(chunksRef.current, { type: mr.mimeType })
-          : null
-        if (blob) {
-          setRecordedBlob(blob)
-          setRecordedUrl((u) => {
-            if (u) URL.revokeObjectURL(u)
-            return URL.createObjectURL(blob)
-          })
+        const mimeType = mr.mimeType || 'audio/webm'
+        const buildBlob = () => {
+          const chunks = chunksRef.current
+          return chunks.length ? new Blob(chunks, { type: mimeType }) : null
         }
-        resolve(blob)
+        const resolveBlob = (blob: Blob | null) => {
+          if (blob) {
+            setRecordedBlob(blob)
+            setRecordedUrl((u) => {
+              if (u) URL.revokeObjectURL(u)
+              return URL.createObjectURL(blob)
+            })
+          }
+          resolve(blob)
+        }
+        const delayMs = 200
+        setTimeout(() => {
+          let blob = buildBlob()
+          if (blob && blob.size > 0) {
+            resolveBlob(blob)
+            return
+          }
+          setTimeout(() => {
+            blob = buildBlob()
+            resolveBlob(blob)
+          }, 150)
+        }, delayMs)
       }
       mr.stop()
     })

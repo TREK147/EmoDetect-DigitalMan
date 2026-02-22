@@ -7,7 +7,8 @@ import VirtualMessageList from '@/components/VirtualMessageList'
 import { useChatStore } from '@/stores/useChatStore'
 import { useToastStore } from '@/stores/useToastStore'
 import { useVoiceRecorder } from '@/hooks/useVoiceRecorder'
-import { chatWithAIStream, uploadFile, ApiError } from '@/utils/api'
+import { saveMessages } from '@/utils/chatStorage'
+import { chatWithAIStream, uploadFile, ApiError, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_LABEL } from '@/utils/api'
 
 /** 超过此条数启用虚拟滚动 */
 const VIRTUAL_SCROLL_THRESHOLD = 30
@@ -22,12 +23,21 @@ interface PendingImage {
   fileName: string
 }
 
+/** 待发送的语音（录制后先展示试听与删除，再点发送才上传） */
+interface PendingVoice {
+  blob: Blob
+  url: string
+  fileName: string
+}
+
 export default function ChatPage() {
   const [inputValue, setInputValue] = useState('')
   const [isAiLoading, setIsAiLoading] = useState(false)
   const [pendingImage, setPendingImage] = useState<PendingImage | null>(null)
+  const [pendingVoice, setPendingVoice] = useState<PendingVoice | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
+  const user = useChatStore((s) => s.user)
   const messages = useChatStore((s) => s.messages)
   const currentConversationId = useChatStore((s) => s.currentConversationId)
   const addMessage = useChatStore((s) => s.addMessage)
@@ -37,8 +47,16 @@ export default function ChatPage() {
   const updateConversation = useChatStore((s) => s.updateConversation)
   const toast = useToastStore((s) => s.show)
   const { startRecording, stopRecording } = useVoiceRecorder()
+  const userId = user?.id ?? 'guest'
 
   const useVirtualScroll = messages.length >= VIRTUAL_SCROLL_THRESHOLD
+
+  // 当前会话消息变更时持久化到本地，便于刷新后在历史记录中恢复
+  useEffect(() => {
+    if (currentConversationId && messages.length >= 0) {
+      saveMessages(userId, currentConversationId, messages)
+    }
+  }, [userId, currentConversationId, messages])
 
   useEffect(() => {
     if (!useVirtualScroll && messages.length > 0) {
@@ -49,7 +67,81 @@ export default function ChatPage() {
   const handleSubmit = async () => {
     const content = inputValue.trim()
     const hasImage = pendingImage != null
-    if ((!content && !hasImage) || isAiLoading) return
+    const hasVoice = pendingVoice != null
+    if ((!content && !hasImage && !hasVoice) || isAiLoading) return
+
+    // 优先处理：仅发送语音（与传文件一样：先展示再发送）
+    if (hasVoice && !hasImage) {
+      const voiceToSend = pendingVoice!
+      if (!voiceToSend.blob || voiceToSend.blob.size === 0) {
+        toast('语音数据为空，请重新录制后再发送')
+        return
+      }
+      setPendingVoice(null)
+      URL.revokeObjectURL(voiceToSend.url)
+      const file = new File([voiceToSend.blob], voiceToSend.fileName, {
+        type: voiceToSend.blob.type || 'audio/webm',
+      })
+      const convId = ensureConversation()
+      setIsAiLoading(true)
+      const aiMsgId = generateId()
+      try {
+        const { url, fileName: name, category } = await uploadFile(file)
+        const msgType: Message['type'] = category === 'voice' ? 'voice' : category === 'video' ? 'video' : 'file'
+        const userMsg: Message = {
+          id: generateId(),
+          content: `[语音] ${name}`,
+          sender: 'user',
+          timestamp: new Date(),
+          type: msgType,
+          fileUrl: url,
+          fileName: name,
+        }
+        addMessage(userMsg)
+        addMessage({
+          id: aiMsgId,
+          content: '',
+          sender: 'ai',
+          timestamp: new Date(),
+          type: 'text',
+        })
+        updateConversation(convId, { lastMessage: userMsg.content, updatedAt: new Date(), messageCount: messages.length + 1 })
+        const history = messages
+          .slice(-20)
+          .filter((m) => m.type === 'text')
+          .map((m) => ({
+            role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
+            content: m.content,
+          }))
+        const hint = `用户发送了一条语音，文件名：${name}，请简单回复。`
+        await chatWithAIStream(
+          hint,
+          (chunk) => {
+            const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
+            updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
+          },
+          history,
+          { attachmentHint: hint }
+        )
+      } catch (err) {
+        const msg =
+          err instanceof ApiError
+            ? (err.message || '语音上传或 AI 回复失败')
+            : (err instanceof Error ? err.message : '网络异常，请检查后端服务与网络后重试')
+        toast(msg)
+        addMessage({
+          id: generateId(),
+          content: `[请求失败] ${msg}`,
+          sender: 'ai',
+          timestamp: new Date(),
+          type: 'text',
+        })
+      } finally {
+        setIsAiLoading(false)
+      }
+      setInputValue('')
+      return
+    }
 
     const displayContent = content || '请描述或分析这张图片'
     let convId = currentConversationId
@@ -148,6 +240,10 @@ export default function ChatPage() {
   const handleFileSelect = async (files: File[]) => {
     const file = files[0]
     if (!file || isAiLoading) return
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      toast(`文件过大，单文件最大支持 ${MAX_FILE_SIZE_LABEL}，请选择更小的文件`)
+      return
+    }
     const isImage = file.type.startsWith('image/')
     if (isImage) {
       try {
@@ -240,8 +336,13 @@ export default function ChatPage() {
     toast('语音录制结束，正在处理…')
     const blob = await stopRecording()
     if (!blob || isAiLoading) return
-    const file = new File([blob], `voice-${Date.now()}.webm`, { type: blob.type || 'audio/webm' })
-    await handleFileSelect([file])
+    if (blob.size === 0) {
+      toast('录制内容为空，请重新录制')
+      return
+    }
+    const fileName = `voice-${Date.now()}.webm`
+    const url = URL.createObjectURL(blob)
+    setPendingVoice({ blob, url, fileName })
   }
 
   return (
@@ -309,6 +410,31 @@ export default function ChatPage() {
           </div>
         )}
 
+        {/* 待发送语音：试听 + 删除，与传文件一致 */}
+        {pendingVoice && (
+          <div className="flex-shrink-0 flex items-center gap-2 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
+            <span className="text-sm text-gray-600 dark:text-gray-400 shrink-0">🎤 语音</span>
+            <audio
+              src={pendingVoice.url}
+              controls
+              className="flex-1 min-w-0 h-8 max-w-[200px] sm:max-w-[280px]"
+              preload="metadata"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                URL.revokeObjectURL(pendingVoice.url)
+                setPendingVoice(null)
+              }}
+              className="p-1.5 rounded-lg text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-600 hover:text-gray-800 dark:hover:text-gray-200 shrink-0"
+              title="移除语音"
+              aria-label="移除语音"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* 输入区域（固定底部） */}
         <div className="flex-shrink-0 pb-[env(safe-area-inset-bottom)]">
           <InputArea
@@ -319,6 +445,7 @@ export default function ChatPage() {
             onVoiceRecordStart={handleVoiceRecordStart}
             onVoiceRecordStop={handleVoiceRecordStop}
             pendingImage={pendingImage}
+            pendingVoice={pendingVoice != null ? { url: pendingVoice.url, fileName: pendingVoice.fileName } : null}
             disabled={isAiLoading}
             placeholder={isAiLoading ? 'AI 正在思考…' : '输入消息...'}
           />

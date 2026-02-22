@@ -69,8 +69,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 当前对话消息
   currentConversationId: null,
   messages: [],
-  setCurrentConversationId: (id) =>
-    set({ currentConversationId: id, messages: [] }),
+  /** 仅切换当前会话 id，不清空 messages；切换/新建会话时由调用方 setMessages 或 clearMessages */
+  setCurrentConversationId: (id) => set({ currentConversationId: id }),
   setMessages: (messages) => set({ messages }),
   addMessage: (message) =>
     set((s) => ({ messages: [...s.messages, message] })),

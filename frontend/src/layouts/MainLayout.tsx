@@ -1,10 +1,16 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Outlet } from 'react-router-dom'
 import Sidebar from '@/components/Sidebar'
 import Header from '@/components/Header'
 import Toast from '@/components/Toast'
 import { useChatStore } from '@/stores/useChatStore'
 import type { Conversation } from '@/types'
+import {
+  loadConversations,
+  saveConversations,
+  loadMessages,
+  deleteMessagesForConversation,
+} from '@/utils/chatStorage'
 import { X } from 'lucide-react'
 
 function generateId(): string {
@@ -20,8 +26,30 @@ export default function MainLayout() {
   const conversations = useChatStore((s) => s.conversations)
   const currentConversationId = useChatStore((s) => s.currentConversationId)
   const addConversation = useChatStore((s) => s.addConversation)
+  const setConversations = useChatStore((s) => s.setConversations)
   const setCurrentConversationId = useChatStore((s) => s.setCurrentConversationId)
+  const setMessages = useChatStore((s) => s.setMessages)
   const clearMessages = useChatStore((s) => s.clearMessages)
+  const removeConversation = useChatStore((s) => s.removeConversation)
+
+  const userId = user?.id ?? 'guest'
+  const authRestoring = useChatStore((s) => s.authRestoring)
+
+  // 刷新或登录后：从本地恢复对话列表，当前界面视为“新聊天”（不恢复当前会话消息）；仅在校验完成后执行一次
+  useEffect(() => {
+    if (authRestoring) return
+    const list = loadConversations(userId)
+    setConversations(list)
+    setCurrentConversationId(null)
+    clearMessages()
+    // 仅依赖 userId / authRestoring，避免每次 conversations 变化时重复清空
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, authRestoring])
+
+  // 对话列表变更时持久化
+  useEffect(() => {
+    saveConversations(userId, conversations)
+  }, [userId, conversations])
 
   const handleNewConversation = () => {
     const conv: Conversation = {
@@ -37,7 +65,14 @@ export default function MainLayout() {
   }
 
   const handleSelectConversation = (id: string) => {
+    const messages = loadMessages(userId, id)
+    setMessages(messages)
     setCurrentConversationId(id)
+  }
+
+  const handleRemoveConversation = (id: string) => {
+    removeConversation(id)
+    deleteMessagesForConversation(userId, id)
   }
 
   return (
@@ -88,7 +123,7 @@ export default function MainLayout() {
           currentConversationId={currentConversationId}
           onNewConversation={handleNewConversation}
           onSelectConversation={handleSelectConversation}
-          onRemoveConversation={(id) => useChatStore.getState().removeConversation(id)}
+          onRemoveConversation={handleRemoveConversation}
           onUpdateConversation={(id, patch) => useChatStore.getState().updateConversation(id, patch)}
           isOpen={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
