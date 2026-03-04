@@ -143,6 +143,11 @@ export async function getCurrentUser(): Promise<User> {
 
 const CACHE_TTL = 5 * 60 * 1000 // 5 分钟
 
+/** 切换账号前调用，清空对话/消息缓存，避免新用户读到旧用户数据 */
+export function invalidateConversationsCache(): void {
+  invalidateCache(/^GET:\/conversations/)
+}
+
 export async function getConversations(): Promise<Conversation[]> {
   const cached = getCached<Conversation[]>('GET', '/conversations')
   if (cached != null) return cached

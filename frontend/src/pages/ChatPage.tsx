@@ -358,7 +358,7 @@ export default function ChatPage() {
           </div>
         )}
 
-        {/* 待发送语音：试听 + 删除，与传文件一致 */}
+        {/* 待发送语音：试听 + 发送 + 删除 */}
         {pendingVoice && (
           <div className="flex-shrink-0 flex items-center gap-2 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
             <span className="text-sm text-gray-600 dark:text-gray-400 shrink-0">🎤 语音</span>
@@ -368,6 +368,16 @@ export default function ChatPage() {
               className="flex-1 min-w-0 h-8 max-w-[200px] sm:max-w-[280px]"
               preload="metadata"
             />
+            <button
+              type="button"
+              onClick={() => handleSubmit()}
+              disabled={isAiLoading}
+              className="px-3 py-1.5 rounded-lg bg-primary-500 text-white text-sm font-medium hover:bg-primary-600 disabled:opacity-50 shrink-0"
+              title="发送语音"
+              aria-label="发送语音"
+            >
+              发送
+            </button>
             <button
               type="button"
               onClick={() => {

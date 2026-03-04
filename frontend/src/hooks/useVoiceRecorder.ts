@@ -299,10 +299,9 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
         setWaveformData(Array(WAVEFORM_LENGTH).fill(0))
         setAudioLevel(0)
         const mimeType = mr.mimeType || 'audio/webm'
-        const buildBlob = () => {
-          const chunks = chunksRef.current
-          return chunks.length ? new Blob(chunks, { type: mimeType }) : null
-        }
+        const chunksSnapshot = [...chunksRef.current]
+        const buildBlob = () =>
+          chunksSnapshot.length ? new Blob(chunksSnapshot, { type: mimeType }) : null
         const resolveBlob = (blob: Blob | null) => {
           if (blob) {
             setRecordedBlob(blob)
@@ -313,7 +312,7 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
           }
           resolve(blob)
         }
-        const delayMs = 200
+        const delayMs = 300
         setTimeout(() => {
           let blob = buildBlob()
           if (blob && blob.size > 0) {
@@ -321,9 +320,8 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
             return
           }
           setTimeout(() => {
-            blob = buildBlob()
-            resolveBlob(blob)
-          }, 150)
+            resolveBlob(buildBlob())
+          }, 250)
         }, delayMs)
       }
       mr.stop()

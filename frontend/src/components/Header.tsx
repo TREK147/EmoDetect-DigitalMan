@@ -3,55 +3,30 @@ import { Link, useNavigate } from 'react-router-dom'
 import { setStoredToken, logout as logoutApi } from '@/utils/api'
 import {
   Menu,
-  Sun,
-  Moon,
-  Monitor,
   Settings,
-  Bell,
   User,
   LogOut,
   ChevronDown,
 } from 'lucide-react'
 import type { User as UserType } from '@/types'
 import { useChatStore } from '@/stores/useChatStore'
-import { useThemeStore } from '@/stores/useThemeStore'
-import {
-  PRIMARY_COLOR_OPTIONS,
-  getPrimaryPalette,
-  type PrimaryColorKey,
-  type ThemeMode,
-} from '@/utils/theme'
 import clsx from 'clsx'
 
 interface HeaderProps {
   onMenuClick?: () => void
   user?: UserType | null
-  notificationCount?: number
-  onNotificationClick?: () => void
   onSettingsClick?: () => void
 }
-
-const THEME_MODE_OPTIONS: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
-  { value: 'light', label: '浅色', icon: Sun },
-  { value: 'dark', label: '深色', icon: Moon },
-  { value: 'system', label: '跟随系统', icon: Monitor },
-]
 
 export default function Header({
   onMenuClick,
   user,
-  notificationCount = 0,
-  onNotificationClick,
   onSettingsClick,
 }: HeaderProps) {
   const [userMenuOpen, setUserMenuOpen] = useState(false)
-  const [themeMenuOpen, setThemeMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
-  const themeMenuRef = useRef<HTMLDivElement>(null)
   const navigate = useNavigate()
   const logout = useChatStore((s) => s.logout)
-  const { mode, resolvedTheme, primaryColor, setMode, setPrimaryColor } =
-    useThemeStore()
 
   const handleLogout = async () => {
     setUserMenuOpen(false)
@@ -69,9 +44,6 @@ export default function Header({
       const target = e.target as Node
       if (userMenuRef.current && !userMenuRef.current.contains(target)) {
         setUserMenuOpen(false)
-      }
-      if (themeMenuRef.current && !themeMenuRef.current.contains(target)) {
-        setThemeMenuOpen(false)
       }
     }
     document.addEventListener('mousedown', handleClickOutside)
@@ -94,95 +66,6 @@ export default function Header({
       </div>
 
       <nav className="flex items-center gap-1 sm:gap-2">
-        <button
-          type="button"
-          onClick={onNotificationClick}
-          className="relative p-2 rounded-lg text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800 transition-colors touch-manipulation"
-          aria-label="通知"
-        >
-          <Bell className="w-5 h-5 sm:w-5 sm:h-5" />
-          {notificationCount > 0 && (
-            <span className="absolute top-1 right-1 min-w-[18px] h-[18px] flex items-center justify-center px-1 rounded-full bg-primary-500 text-white text-xs font-medium">
-              {notificationCount > 99 ? '99+' : notificationCount}
-            </span>
-          )}
-        </button>
-
-        {/* 主题：模式 + 主题色 */}
-        <div className="relative" ref={themeMenuRef}>
-          <button
-            type="button"
-            onClick={() => setThemeMenuOpen((v) => !v)}
-            className="p-2 rounded-lg text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800 transition-colors touch-manipulation"
-            aria-label="主题设置"
-            aria-expanded={themeMenuOpen}
-          >
-            {resolvedTheme === 'light' ? (
-              <Sun className="w-5 h-5" />
-            ) : (
-              <Moon className="w-5 h-5" />
-            )}
-          </button>
-          {themeMenuOpen && (
-            <div
-              className="absolute right-0 top-full mt-1 py-2 px-3 w-56 rounded-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-lg z-50"
-              role="dialog"
-              aria-label="主题设置"
-            >
-              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2 px-1">
-                外观
-              </p>
-              <div className="flex flex-col sm:flex-row gap-1 mb-3">
-                {THEME_MODE_OPTIONS.map(({ value, label, icon: Icon }) => (
-                  <button
-                    key={value}
-                    type="button"
-                    onClick={() => {
-                      setMode(value)
-                      setThemeMenuOpen(false)
-                    }}
-                    className={clsx(
-                      'flex-1 flex items-center justify-center gap-1.5 py-2 px-2 rounded-lg text-sm transition-colors min-w-0',
-                      mode === value
-                        ? 'bg-primary-100 dark:bg-primary-900/30 text-primary-600 dark:text-primary-400'
-                        : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
-                    )}
-                  >
-                    <Icon className="w-4 h-4 shrink-0" />
-                    <span className="truncate">{label}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2 px-1">
-                主题色
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {PRIMARY_COLOR_OPTIONS.map(({ key, label }) => {
-                  const palette = getPrimaryPalette(key as PrimaryColorKey)
-                  return (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => {
-                        setPrimaryColor(key as PrimaryColorKey)
-                      }}
-                      className={clsx(
-                        'w-8 h-8 rounded-full border-2 transition-transform touch-manipulation',
-                        primaryColor === key
-                          ? 'border-gray-800 dark:border-white scale-110'
-                          : 'border-transparent hover:scale-105'
-                      )}
-                      style={{ backgroundColor: palette[500] }}
-                      title={label}
-                      aria-label={label}
-                    />
-                  )
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-
         <button
           type="button"
           onClick={onSettingsClick}

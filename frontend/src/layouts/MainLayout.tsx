@@ -10,12 +10,20 @@ import {
   getMessages,
   deleteConversation,
   patchConversation,
+  invalidateConversationsCache,
 } from '@/utils/api'
-import { X } from 'lucide-react'
+import { X, Sun, Moon, Monitor } from 'lucide-react'
+import clsx from 'clsx'
+import { useThemeStore } from '@/stores/useThemeStore'
+import {
+  PRIMARY_COLOR_OPTIONS,
+  getPrimaryPalette,
+  type PrimaryColorKey,
+  type ThemeMode,
+} from '@/utils/theme'
 
 export default function MainLayout() {
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [notificationOpen, setNotificationOpen] = useState(false)
   const user = useChatStore((s) => s.user)
   const sidebarOpen = useChatStore((s) => s.sidebarOpen)
   const setSidebarOpen = useChatStore((s) => s.setSidebarOpen)
@@ -30,10 +38,18 @@ export default function MainLayout() {
   const updateConversation = useChatStore((s) => s.updateConversation)
 
   const authRestoring = useChatStore((s) => s.authRestoring)
+  const { mode, primaryColor, setMode, setPrimaryColor } = useThemeStore()
 
-  // 登录/恢复后：从服务端拉取会话列表
+  const THEME_MODE_OPTIONS: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
+    { value: 'light', label: '浅色', icon: Sun },
+    { value: 'dark', label: '深色', icon: Moon },
+    { value: 'system', label: '跟随系统', icon: Monitor },
+  ]
+
+  // 登录/恢复后：从服务端拉取会话列表（切换账号时先清缓存，避免读到上一账号的对话）
   useEffect(() => {
     if (authRestoring || !user) return
+    invalidateConversationsCache()
     getConversations()
       .then((list) => {
         setConversations(list)
@@ -95,10 +111,9 @@ export default function MainLayout() {
       <Header
         user={user}
         onSettingsClick={() => setSettingsOpen(true)}
-        onNotificationClick={() => setNotificationOpen(true)}
       />
 
-      {/* 设置弹层（演示） */}
+      {/* 设置弹层 */}
       {settingsOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" onClick={() => setSettingsOpen(false)}>
           <div className="bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-sm w-full p-6 border border-gray-200 dark:border-gray-700" onClick={(e) => e.stopPropagation()}>
@@ -108,22 +123,53 @@ export default function MainLayout() {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-sm text-gray-500 dark:text-gray-400">此处为设置页演示，接入后端后可配置通知、隐私等。</p>
-          </div>
-        </div>
-      )}
-
-      {/* 通知弹层（演示） */}
-      {notificationOpen && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center sm:p-4 bg-black/50" onClick={() => setNotificationOpen(false)}>
-          <div className="bg-white dark:bg-gray-800 rounded-t-xl sm:rounded-xl shadow-xl max-w-sm w-full p-6 border border-gray-200 dark:border-gray-700 max-h-[60vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold text-gray-800 dark:text-white">通知</h2>
-              <button type="button" onClick={() => setNotificationOpen(false)} className="p-1 rounded text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700" aria-label="关闭">
-                <X className="w-5 h-5" />
-              </button>
+            <div className="space-y-4">
+              <div>
+                <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">外观</p>
+                <div className="flex flex-col sm:flex-row gap-1">
+                  {THEME_MODE_OPTIONS.map(({ value, label, icon: Icon }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setMode(value)}
+                      className={clsx(
+                        'flex-1 flex items-center justify-center gap-1.5 py-2 px-2 rounded-lg text-sm transition-colors min-w-0',
+                        mode === value
+                          ? 'bg-primary-100 dark:bg-primary-900/30 text-primary-600 dark:text-primary-400'
+                          : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'
+                      )}
+                    >
+                      <Icon className="w-4 h-4 shrink-0" />
+                      <span className="truncate">{label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">主题色</p>
+                <div className="flex flex-wrap gap-2">
+                  {PRIMARY_COLOR_OPTIONS.map(({ key, label }) => {
+                    const palette = getPrimaryPalette(key as PrimaryColorKey)
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => setPrimaryColor(key as PrimaryColorKey)}
+                        className={clsx(
+                          'w-8 h-8 rounded-full border-2 transition-transform touch-manipulation',
+                          primaryColor === key
+                            ? 'border-gray-800 dark:border-white scale-110'
+                            : 'border-transparent hover:scale-105'
+                        )}
+                        style={{ backgroundColor: palette[500] }}
+                        title={label}
+                        aria-label={label}
+                      />
+                    )
+                  })}
+                </div>
+              </div>
             </div>
-            <p className="text-sm text-gray-500 dark:text-gray-400">暂无通知（演示）</p>
           </div>
         </div>
       )}

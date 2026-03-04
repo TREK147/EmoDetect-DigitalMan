@@ -44,6 +44,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       user: null,
       currentConversationId: null,
       messages: [],
+      conversations: [],
     }),
   isLoggedIn: () => get().user != null,
 

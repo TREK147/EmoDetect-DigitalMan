@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Link } from 'react-router-dom'
-import { Plus, Search, User, Menu, X, Pencil, MoreVertical, Share2, Pin, Trash2 } from 'lucide-react'
+import { Plus, Search, User, Menu, X, Pencil, MoreVertical, Pin, Trash2 } from 'lucide-react'
 import type { User as UserType, Conversation } from '@/types'
 import { formatDistanceToNow } from 'date-fns'
 import { zhCN } from 'date-fns/locale'
@@ -13,14 +13,12 @@ const PANEL_WIDTH = 280
 function ConversationMenu({
   conversation,
   onClose,
-  onShare,
   onPin,
   onRename,
   onDelete,
 }: {
   conversation: Conversation
   onClose: () => void
-  onShare: () => void
   onPin: () => void
   onRename: () => void
   onDelete: () => void
@@ -40,14 +38,6 @@ function ConversationMenu({
         ref={menuRef}
         className="absolute right-0 top-full mt-1 z-50 min-w-[180px] py-1 rounded-lg bg-gray-800 dark:bg-gray-700 border border-gray-600 dark:border-gray-600 shadow-xl"
       >
-        <button
-          type="button"
-          onClick={onShare}
-          className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700 dark:hover:bg-gray-600 transition-colors"
-        >
-          <Share2 className="w-4 h-4 shrink-0" />
-          分享对话内容
-        </button>
         <button
           type="button"
           onClick={onPin}
@@ -235,13 +225,6 @@ export default function Sidebar({
                     <ConversationMenu
                       conversation={conv}
                       onClose={() => setMenuConvId(null)}
-                      onShare={() => {
-                        setMenuConvId(null)
-                        // 分享：复制当前对话标题或链接（演示）
-                        if (navigator.clipboard?.writeText) {
-                          navigator.clipboard.writeText(conv.title)
-                        }
-                      }}
                       onPin={() => {
                         onUpdateConversation?.(conv.id, { pinned: !conv.pinned })
                         setMenuConvId(null)
