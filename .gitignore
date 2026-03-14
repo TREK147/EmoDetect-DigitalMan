@@ -1,4 +1,38 @@
-.env
+# --- 后端相关 (Python/Flask) ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+instance/
+.pytest_cache/
+backend/logs/
+*.log
+
+# --- 前端相关 (Node/Vite/React) ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vscode/*
+!.vscode/extensions.json
+.eslintcache
+.stylelintcache
+
+# --- 业务上传数据 (极其重要) ---
+uploads/
 static/uploads/
+temp/
+
+# --- 系统与编辑器相关 ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.bak
+
+# --- 数据库临时文件 ---
+*.sqlite
+*.db
