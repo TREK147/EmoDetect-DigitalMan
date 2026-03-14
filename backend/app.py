@@ -7,13 +7,28 @@ import os
 import secrets
 import uuid
 import requests
+import websocket
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
-from config import CHAT_API_URL, API_KEY, CHAT_MODEL, MAX_TOKENS
+from config import (
+    CHAT_API_URL,
+    API_KEY,
+    CHAT_MODEL,
+    MAX_TOKENS,
+    REALTIME_WS_URL,
+    REALTIME_API_KEY,
+    REALTIME_MODEL,
+    DOUBAO_TTS_APP_ID,
+    DOUBAO_TTS_ACCESS_TOKEN,
+    DOUBAO_TTS_CLUSTER,
+    DOUBAO_TTS_URL,
+    DOUBAO_TTS_RESOURCE_ID,
+    DOUBAO_TTS_DEFAULT_VOICE,
+)
 import database as db
 
 # 单文件上传最大 10MB，与前端一致；超过时请求被拒绝
@@ -163,6 +178,65 @@ def serve_upload(rel):
     if not os.path.isfile(path):
         return jsonify({"error": "文件不存在"}), 404
     return send_from_directory(UPLOAD_DIR, rel, as_attachment=False)
+
+
+def _extract_schedules_from_text(user_id: int, text: str) -> list:
+    """从用户一句话中抽取日程（如「明天去见孙老师」），写入 user_schedules。"""
+    if not (text or "").strip():
+        return []
+    text = (text or "").strip()[:1500]
+    created = []
+    from datetime import datetime, timedelta
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if API_KEY:
+        try:
+            system = f"""当前日期：{today_str}。你只输出一个 JSON 数组，不要 markdown 或其它文字。
+从用户这句话里提取明确的日程/待办（某天要做的事、见谁、开会等）。每个元素：{{"title":"事项简述","scheduled_at":"YYYY-MM-DD HH:MM:SS"}}。
+时间推断：明天={tomorrow_str} 10:00:00，后天=+2天，大后天=+3天；未说具体时间则用当天 10:00:00。没有明确日程则输出 []。"""
+            payload = {
+                "model": CHAT_MODEL,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
+                "max_tokens": 500,
+                "stream": False,
+            }
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+            r = requests.post(CHAT_API_URL, json=payload, headers=headers, timeout=15)
+            if r.status_code == 200:
+                out = r.json()
+                text_out = (out.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                for raw in (text_out, text_out.replace("```json", "").replace("```", "").strip()):
+                    try:
+                        parsed = json.loads(raw)
+                        arr = parsed if isinstance(parsed, list) else []
+                        for item in arr:
+                            if isinstance(item, dict) and item.get("title") and item.get("scheduled_at"):
+                                st = (item.get("scheduled_at") or "").replace("T", " ").strip()[:19]
+                                if len(st) >= 16:
+                                    sid = db.create_schedule(int(user_id), title=(item.get("title") or "").strip()[:500], scheduled_at=st, source="conversation", raw_text=text[:500])
+                                    created.append({"id": sid, "title": item.get("title"), "scheduled_at": st})
+                        if created:
+                            return created
+                        break
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+        except Exception:
+            pass
+    for day_offset, kw in [(1, "明天"), (2, "后天"), (3, "大后天")]:
+        if kw in text:
+            day = (today + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+            title = text.replace(kw, "").strip().replace("要去", "").replace("去", "").replace("和", "、").strip()
+            if not title or len(title) < 2:
+                title = f"待办（{day}）"
+            scheduled_at = f"{day} 10:00:00"
+            try:
+                sid = db.create_schedule(int(user_id), title=title[:500], scheduled_at=scheduled_at, source="conversation", raw_text=text[:500])
+                created.append({"id": sid, "title": title, "scheduled_at": scheduled_at})
+            except Exception:
+                pass
+            return created
+    return created
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -414,10 +488,11 @@ def chat_stream():
                             yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
                     except (json.JSONDecodeError, IndexError, KeyError, TypeError):
                         pass
-                # 流结束后写入 assistant 消息并更新会话摘要
+                # 流结束后写入 assistant 消息并更新会话摘要；从用户输入中抽取日程并写入
                 ai_content = "".join(full_content).strip() or "（无回复）"
                 db.create_message(conv_id, "assistant", ai_content, "text", None, None)
                 db.update_conversation_last_message(conv_id, ai_content)
+                _extract_schedules_from_text(int(user_id), user_content)
                 yield "data: [DONE]\n\n"
             except requests.RequestException as e:
                 err = str(e)
@@ -444,6 +519,333 @@ def chat_stream():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# ---------- 日程（个人中心用） ----------
+
+
+def _schedule_row_to_json(row):
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "title": row["title"],
+        "scheduled_at": row["scheduled_at"].isoformat() if hasattr(row.get("scheduled_at"), "isoformat") else str(row.get("scheduled_at", "")),
+        "end_at": row["end_at"].isoformat() if row.get("end_at") and hasattr(row["end_at"], "isoformat") else (str(row["end_at"]) if row.get("end_at") else None),
+        "source": (row.get("source") or "conversation").strip(),
+        "raw_text": (row.get("raw_text") or "").strip() or None,
+        "status": (row.get("status") or "pending").strip(),
+        "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
+    }
+
+
+@app.route("/api/schedules", methods=["GET"])
+def schedules_list():
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        start_date = request.args.get("startDate") or request.args.get("start_date")
+        end_date = request.args.get("endDate") or request.args.get("end_date")
+        rows = db.get_schedules_by_user(int(user_id), start_date=start_date, end_date=end_date)
+        return jsonify([_schedule_row_to_json(r) for r in rows])
+    except Exception as e:
+        return _err("查询失败: " + str(e), 500)
+
+
+@app.route("/api/schedules", methods=["POST"])
+def schedules_create():
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    title = (data.get("title") or "").strip()
+    scheduled_at = (data.get("scheduled_at") or data.get("scheduledAt") or "").strip().replace("T", " ")[:19]
+    if not title or not scheduled_at:
+        return _err("请填写 title 和 scheduled_at")
+    if len(scheduled_at) == 16:
+        scheduled_at = scheduled_at + ":00"
+    try:
+        end_at = (data.get("end_at") or data.get("endAt") or "").strip().replace("T", " ")[:19] or None
+        sid = db.create_schedule(int(user_id), title, scheduled_at, end_at=end_at, source="manual")
+        row = db.get_schedule_by_id(sid, int(user_id))
+        return jsonify(_schedule_row_to_json(row))
+    except Exception as e:
+        return _err("创建失败: " + str(e), 500)
+
+
+@app.route("/api/schedules/<int:schedule_id>", methods=["PATCH"])
+def schedule_patch(schedule_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    updates = {}
+    if "title" in data:
+        updates["title"] = (data.get("title") or "").strip()
+    if "scheduled_at" in data or "scheduledAt" in data:
+        raw = (data.get("scheduled_at") or data.get("scheduledAt") or "").strip().replace("T", " ")[:19]
+        if len(raw) == 16:
+            raw = raw + ":00"
+        updates["scheduled_at"] = raw
+    if "end_at" in data or "endAt" in data:
+        raw = (data.get("end_at") or data.get("endAt") or "").strip().replace("T", " ")[:19] or None
+        if raw and len(raw) == 16:
+            raw = raw + ":00"
+        updates["end_at"] = raw
+    if "status" in data:
+        updates["status"] = (data.get("status") or "pending").strip()[:20]
+    if not updates:
+        row = db.get_schedule_by_id(schedule_id, int(user_id))
+        if not row:
+            return _err("日程不存在", 404)
+        return jsonify(_schedule_row_to_json(row))
+    ok = db.update_schedule(schedule_id, int(user_id), **updates)
+    if not ok:
+        return _err("日程不存在", 404)
+    row = db.get_schedule_by_id(schedule_id, int(user_id))
+    return jsonify(_schedule_row_to_json(row))
+
+
+@app.route("/api/schedules/<int:schedule_id>", methods=["DELETE"])
+def schedule_delete(schedule_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    ok = db.delete_schedule(schedule_id, int(user_id))
+    if not ok:
+        return _err("日程不存在", 404)
+    return jsonify({"ok": True})
+
+
+# ---------- 实时对话（DashScope Realtime：语音入 -> 文本+语音出，与聊天框同步） ----------
+
+_REALTIME_CHUNK_BYTES = 3200  # 100ms @ 16k 16bit mono
+
+
+def _realtime_stream(conv_id, user_id, pcm_base64):
+    """连接 DashScope Realtime，发送 PCM 音频，流式返回文本与音频。"""
+    url = f"{REALTIME_WS_URL.rstrip('/')}?model={REALTIME_MODEL}"
+    headers = [f"Authorization: Bearer {REALTIME_API_KEY}"]
+    full_transcript = []
+    try:
+        ws = websocket.create_connection(url, header=headers, timeout=30)
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        return
+    try:
+        # session.update：modalities 顺序需为 ['audio','text']（文档要求），仅输出文本+音频，不启用 VAD
+        session_event = {
+            "type": "session.update",
+            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
+            "session": {
+                "modalities": ["audio", "text"],
+                "voice": "Cherry",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm24",
+                "input_audio_transcription": {"model": "gummy-realtime-v1"},
+                "turn_detection": None,
+                "instructions": "你是智慧星数字人助手，请简洁友好地回复。",
+            },
+        }
+        ws.send(json.dumps(session_event, ensure_ascii=False))
+        # 等待 session.updated 后再发音频（可能先收到 session.created）
+        while True:
+            first = ws.recv()
+            if not first:
+                break
+            try:
+                ev = json.loads(first)
+                typ = ev.get("type") or ""
+                if typ == "error":
+                    err = ev.get("error") or {}
+                    msg = err.get("message") or ev.get("message") or str(ev.get("code", "unknown"))
+                    yield f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n"
+                    return
+                if typ == "session.updated":
+                    break
+            except json.JSONDecodeError:
+                break
+
+        # 发送 PCM：按 3200 字节一块 append
+        pcm_bytes = base64.b64decode(pcm_base64)
+        for i in range(0, len(pcm_bytes), _REALTIME_CHUNK_BYTES):
+            chunk = pcm_bytes[i : i + _REALTIME_CHUNK_BYTES]
+            b64_chunk = base64.b64encode(chunk).decode("ascii")
+            ws.send(json.dumps({
+                "type": "input_audio_buffer.append",
+                "event_id": f"evt_{uuid.uuid4().hex[:24]}",
+                "audio": b64_chunk,
+            }, ensure_ascii=False))
+
+        ws.send(json.dumps({
+            "type": "input_audio_buffer.commit",
+            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
+        }, ensure_ascii=False))
+
+        ws.send(json.dumps({
+            "type": "response.create",
+            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
+        }, ensure_ascii=False))
+
+        while True:
+            msg = ws.recv()
+            if not msg:
+                break
+            try:
+                ev = json.loads(msg)
+            except json.JSONDecodeError:
+                continue
+            typ = ev.get("type") or ""
+            if typ == "response.audio_transcript.delta":
+                delta = (ev.get("delta") or "").strip()
+                if delta:
+                    full_transcript.append(delta)
+                    yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
+            elif typ == "response.audio.delta":
+                delta_b64 = ev.get("delta") or ""
+                if delta_b64:
+                    yield f"data: {json.dumps({'audio': delta_b64}, ensure_ascii=False)}\n\n"
+            elif typ == "error":
+                err = ev.get("error") or {}
+                msg = err.get("message") or ev.get("message") or str(ev.get("code", "unknown"))
+                yield f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n"
+                break
+            elif typ == "response.done":
+                break
+        ai_content = "".join(full_transcript).strip() or "（无回复）"
+        db.create_message(conv_id, "assistant", ai_content, "text", None, None)
+        db.update_conversation_last_message(conv_id, ai_content)
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/chat/realtime", methods=["POST"])
+def chat_realtime():
+    """
+    实时语音对话：请求体需 conversationId、pcmBase64（16k 16bit 单声道 PCM 的 base64）。
+    返回 SSE：data: {"content": "文本片段"} 或 data: {"audio": "base64"}，结束 data: [DONE]。
+    仅当「点击数字人」开启语音时，前端发送语音消息走此接口，实现文字与语音同步输出。
+    """
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        conv_id_raw = data.get("conversationId") or data.get("conversation_id")
+        pcm_base64 = (data.get("pcmBase64") or "").strip()
+        if conv_id_raw is None:
+            return jsonify({"error": "缺少 conversationId"}), 400
+        if not pcm_base64:
+            return jsonify({"error": "缺少 pcmBase64（16k 16bit 单声道 PCM 的 base64）"}), 400
+        try:
+            conv_id = int(conv_id_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "conversationId 无效"}), 400
+        owner = db.get_conversation_owner(conv_id)
+        if owner is None or owner != int(user_id):
+            return jsonify({"error": "会话不存在或无权访问"}), 404
+
+        user_content = "[语音]"
+        db.create_message(conv_id, "user", user_content, "voice", None, None)
+        db.update_conversation_last_message(conv_id, user_content)
+
+        return Response(
+            _realtime_stream(conv_id, user_id, pcm_base64),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------- 豆包 TTS 语音合成（数字人发声） ----------
+
+
+@app.route("/api/tts", methods=["POST"])
+def tts():
+    """
+    文本转语音，调用豆包语音合成大模型 HTTP V1 接口。
+    请求体: { "text": "要合成的文本" }，返回 mp3 音频字节。
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "缺少 text 参数"}), 400
+        if len(text.encode("utf-8")) > 1024:
+            return jsonify({"error": "文本过长，最长支持约 1000 字节"}), 400
+
+        speed = float(data.get("speed_ratio", 1.0) or 1.0)
+        speed = max(0.1, min(2.0, speed))
+
+        payload = {
+            "app": {
+                "appid": DOUBAO_TTS_APP_ID,
+                "token": DOUBAO_TTS_ACCESS_TOKEN,
+                "cluster": DOUBAO_TTS_CLUSTER or "volcano_tts",
+            },
+            "user": {"uid": "wisdom-star"},
+            "audio": {
+                "voice_type": data.get("voice_type") or DOUBAO_TTS_DEFAULT_VOICE,
+                "encoding": "mp3",
+                "speed_ratio": speed,
+                "volume_ratio": 1.0,
+            },
+            "request": {
+                "reqid": str(uuid.uuid4()),
+                "text": text,
+                "operation": "query",
+            },
+        }
+        if DOUBAO_TTS_RESOURCE_ID:
+            payload["request"]["model"] = DOUBAO_TTS_RESOURCE_ID
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer;{DOUBAO_TTS_ACCESS_TOKEN}",
+        }
+        if DOUBAO_TTS_RESOURCE_ID:
+            headers["X-Api-Resource-Id"] = DOUBAO_TTS_RESOURCE_ID
+        resp = requests.post(
+            DOUBAO_TTS_URL,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        code = result.get("code", 0)
+        if code != 3000:
+            msg = result.get("message") or f"code={code}"
+            return jsonify({"error": f"TTS 合成失败: {msg}"}), 502
+        b64_data = result.get("data") or ""
+        if not b64_data:
+            return jsonify({"error": "TTS 返回音频为空"}), 502
+        audio_bytes = base64.b64decode(b64_data)
+        return Response(audio_bytes, mimetype="audio/mpeg")
+    except requests.RequestException as e:
+        err = str(e)
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                j = e.response.json()
+                err = j.get("message") or j.get("error") or err
+            except Exception:
+                err = (getattr(e.response, "text", None) or err)[:300]
+        return jsonify({"error": f"TTS 请求失败: {err}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------- 认证：注册 / 登录 / 登出 / 当前用户 ----------

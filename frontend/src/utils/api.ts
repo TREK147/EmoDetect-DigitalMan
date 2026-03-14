@@ -381,7 +381,144 @@ export async function sendMessageStreamWithRetry(
   throw lastError
 }
 
-// ---------- 5. AI 对话（对接 backend /api/chat，转发 AutoDL） ----------
+// ---------- 5. 实时语音（DashScope Realtime：语音入 -> 文本+语音出，与聊天框同步） ----------
+
+const REALTIME_PCM_SAMPLE_RATE = 16000
+
+/**
+ * 将录音 Blob（如 webm）解码为 16k 16bit 单声道 PCM，返回 base64。
+ * 供「点击数字人」后发送语音时调用 Realtime 接口使用。
+ */
+export async function decodeAudioBlobToPcm16Base64(blob: Blob): Promise<string> {
+  const arrayBuffer = await blob.arrayBuffer()
+  const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
+  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0))
+  const srcRate = audioBuffer.sampleRate
+  const channel = audioBuffer.getChannelData(0)
+  const srcLength = channel.length
+  const dstLength = Math.floor((srcLength * REALTIME_PCM_SAMPLE_RATE) / srcRate)
+  const pcm16 = new Int16Array(dstLength)
+  for (let i = 0; i < dstLength; i++) {
+    const srcIndex = (i * srcRate) / REALTIME_PCM_SAMPLE_RATE
+    const idx = Math.floor(srcIndex)
+    const frac = srcIndex - idx
+    const s = idx < srcLength - 1 ? channel[idx]! + frac * (channel[idx + 1]! - channel[idx]!) : channel[idx]!
+    const v = Math.max(-1, Math.min(1, s))
+    pcm16[i] = v < 0 ? v * 0x8000 : v * 0x7fff
+  }
+  const b64 = btoa(
+    String.fromCharCode(...new Uint8Array(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength))
+  )
+  await audioContext.close()
+  return b64
+}
+
+/**
+ * 实时语音对话：发送 PCM base64，通过 SSE 接收文本片段与音频片段（与聊天框同步）。
+ * 仅当「点击数字人」开启语音时，发送语音消息走此接口。
+ */
+export async function chatRealtimeStream(
+  conversationId: string,
+  pcmBase64: string,
+  onTextDelta: (delta: string) => void,
+  onAudioDelta: (base64: string) => void
+): Promise<void> {
+  const token = getStoredToken()
+  const res = await fetch(`${BASE_URL}/chat/realtime`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ conversationId, pcmBase64 }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `实时语音请求失败: ${res.status}`,
+      res.status
+    )
+  }
+  const reader = res.body?.getReader()
+  if (!reader) return
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (raw === '[DONE]') return
+      try {
+        const data = JSON.parse(raw) as { content?: string; audio?: string; error?: string }
+        if (data.error) throw new ApiError(data.error, 500)
+        if (data.content) onTextDelta(data.content)
+        if (data.audio) onAudioDelta(data.audio)
+      } catch (e) {
+        if (e instanceof ApiError) throw e
+      }
+    }
+  }
+  if (buffer.startsWith('data: ')) {
+    const raw = buffer.slice(6).trim()
+    if (raw !== '[DONE]') {
+      try {
+        const data = JSON.parse(raw) as { content?: string; audio?: string; error?: string }
+        if (data.error) throw new ApiError(data.error, 500)
+        if (data.content) onTextDelta(data.content)
+        if (data.audio) onAudioDelta(data.audio)
+      } catch (e) {
+        if (e instanceof ApiError) throw e
+      }
+    }
+  }
+}
+
+// ---------- 6. 豆包 TTS（已由 Realtime 替代数字人语音，保留供可选） ----------
+
+/**
+ * 文本转语音，返回音频 Blob（例如 mp3）。
+ * 前端拿到 Blob 后自行创建 Audio 播放，用于数字人播报。
+ * @param text 要合成的文本
+ * @param voiceType 可选，豆包控制台「音色详情」中的 Voice_type（如 zh_female_meilinvyou_moon_bigtts）
+ */
+export async function textToSpeech(
+  text: string,
+  voiceType?: string
+): Promise<Blob> {
+  const token = getStoredToken()
+  const body: { text: string; voice_type?: string } = {
+    text: text.slice(0, 2000),
+  }
+  if (voiceType) body.voice_type = voiceType
+  const res = await fetch(`${BASE_URL}/tts`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    let message = `语音合成失败: ${res.status}`
+    try {
+      const err = (await res.json()) as { error?: string }
+      if (err?.error) message = err.error
+    } catch {
+      // ignore json parse error
+    }
+    throw new ApiError(message, res.status)
+  }
+
+  return res.blob()
+}
+
+// ---------- 6. AI 对话（对接 backend /api/chat，转发 DashScope） ----------
 
 export interface ChatHistoryItem {
   role: 'user' | 'assistant'
@@ -514,4 +651,82 @@ export async function chatWithAIStream(
       }
     }
   }
+}
+
+// ---------- 情绪异常与主动疏导 ----------
+
+export interface EmotionAnomaly {
+  id: number
+  user_id: number
+  emotion_label: string
+  reason: string
+  from_monitoring: number
+  created_at: string
+}
+
+export interface EmotionStatsPoint {
+  date: string
+  count: number
+}
+
+export async function getEmotionStats(days = 30): Promise<EmotionStatsPoint[]> {
+  const res = await client.get<EmotionStatsPoint[]>('/emotion/stats', { params: { days } })
+  return res.data ?? []
+}
+
+export async function getEmotionAnomalies(params?: { limit?: number; since_days?: number }): Promise<EmotionAnomaly[]> {
+  const res = await client.get<EmotionAnomaly[]>('/emotion/anomalies', { params: params ?? {} })
+  return res.data ?? []
+}
+
+export interface ProactiveTrigger {
+  id: number
+  trigger_type: string
+  created_at: string
+}
+
+export async function getProactivePending(): Promise<ProactiveTrigger | null> {
+  const res = await client.get<ProactiveTrigger | null>('/proactive/pending')
+  return res.data ?? null
+}
+
+export async function ackProactiveTrigger(triggerId: number): Promise<{ ok: boolean }> {
+  const res = await client.post<{ ok: boolean }>('/proactive/ack', { triggerId })
+  return res.data
+}
+
+// ---------- 日程管理 ----------
+
+export interface Schedule {
+  id: number
+  user_id: number
+  title: string
+  scheduled_at: string
+  end_at: string | null
+  source: string
+  raw_text: string | null
+  status: string
+  created_at: string
+}
+
+export async function getSchedules(params?: { startDate?: string; endDate?: string }): Promise<Schedule[]> {
+  const res = await client.get<Schedule[]>('/schedules', { params: params ?? {} })
+  return res.data ?? []
+}
+
+export async function createSchedule(data: { title: string; scheduled_at: string; end_at?: string }): Promise<Schedule> {
+  const res = await client.post<Schedule>('/schedules', data)
+  return res.data
+}
+
+export async function updateSchedule(
+  id: number,
+  patch: { title?: string; scheduled_at?: string; end_at?: string; status?: string }
+): Promise<Schedule> {
+  const res = await client.patch<Schedule>(`/schedules/${id}`, patch)
+  return res.data
+}
+
+export async function deleteSchedule(id: number): Promise<void> {
+  await client.delete(`/schedules/${id}`)
 }

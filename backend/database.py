@@ -298,14 +298,114 @@ def get_conversation_owner(conversation_id: int) -> Optional[int]:
             return row["user_id"] if row else None
 
 
+# ---------- 用户日程（从对话提取或手动添加） ----------
+
+
+def create_user_schedules_table():
+    sql = """
+    CREATE TABLE IF NOT EXISTS user_schedules (
+      id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      user_id      INT          NOT NULL,
+      title        VARCHAR(500) NOT NULL COMMENT '事项标题',
+      scheduled_at DATETIME     NOT NULL COMMENT '计划时间',
+      end_at       DATETIME     NULL COMMENT '结束时间',
+      source       VARCHAR(32)  NOT NULL DEFAULT 'conversation' COMMENT 'conversation|manual',
+      raw_text     TEXT         NULL COMMENT '原始对话片段',
+      status       VARCHAR(20)  NOT NULL DEFAULT 'pending' COMMENT 'pending|done|cancelled',
+      created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_user_time (user_id, scheduled_at),
+      KEY idx_user_status (user_id, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户日程'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def create_schedule(user_id: int, title: str, scheduled_at: str, end_at: Optional[str] = None, source: str = "conversation", raw_text: Optional[str] = None) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_schedules (user_id, title, scheduled_at, end_at, source, raw_text)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (user_id, (title or "").strip()[:500], scheduled_at, end_at, (source or "conversation")[:32], (raw_text or "")[:2000]),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def get_schedules_by_user(user_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None, limit: int = 200) -> list:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if start_date and end_date:
+                cur.execute(
+                    """SELECT id, user_id, title, scheduled_at, end_at, source, raw_text, status, created_at
+                       FROM user_schedules WHERE user_id = %s AND status = 'pending'
+                       AND scheduled_at >= %s AND scheduled_at <= %s
+                       ORDER BY scheduled_at ASC LIMIT %s""",
+                    (user_id, start_date, end_date, max(1, limit)),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, user_id, title, scheduled_at, end_at, source, raw_text, status, created_at
+                       FROM user_schedules WHERE user_id = %s ORDER BY scheduled_at DESC LIMIT %s""",
+                    (user_id, max(1, limit)),
+                )
+            return cur.fetchall()
+
+
+def get_schedule_by_id(schedule_id: int, user_id: int) -> Optional[dict]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, title, scheduled_at, end_at, source, raw_text, status, created_at FROM user_schedules WHERE id = %s AND user_id = %s",
+                (schedule_id, user_id),
+            )
+            return cur.fetchone()
+
+
+def update_schedule(schedule_id: int, user_id: int, title: Optional[str] = None, scheduled_at: Optional[str] = None, end_at: Optional[str] = None, status: Optional[str] = None) -> bool:
+    updates, args = [], []
+    if title is not None:
+        updates.append("title = %s")
+        args.append((title or "").strip()[:500])
+    if scheduled_at is not None:
+        updates.append("scheduled_at = %s")
+        args.append(scheduled_at)
+    if end_at is not None:
+        updates.append("end_at = %s")
+        args.append(end_at)
+    if status is not None:
+        updates.append("status = %s")
+        args.append((status or "pending")[:20])
+    if not updates:
+        return True
+    args.extend([schedule_id, user_id])
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE user_schedules SET " + ", ".join(updates) + " WHERE id = %s AND user_id = %s", tuple(args))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def delete_schedule(schedule_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_schedules WHERE id = %s AND user_id = %s", (schedule_id, user_id))
+            conn.commit()
+            return cur.rowcount > 0
+
+
 def init_db():
     """初始化数据库（创建表等）。"""
     create_users_table()
     create_emotion_labels_table()
     create_conversations_table()
     create_messages_table()
+    create_user_schedules_table()
 
 
 if __name__ == "__main__":
     init_db()
-    print("users 表、emotion_labels 表已创建或已存在。")
+    print("users 表、emotion_labels、conversations、messages、user_schedules 已创建或已存在。")

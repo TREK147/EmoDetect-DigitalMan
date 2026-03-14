@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import type { Message } from '@/types'
 import MessageBubble from '@/components/MessageBubble'
 import InputArea from '@/components/InputArea'
@@ -7,10 +7,22 @@ import VirtualMessageList from '@/components/VirtualMessageList'
 import { useChatStore } from '@/stores/useChatStore'
 import { useToastStore } from '@/stores/useToastStore'
 import { useVoiceRecorder } from '@/hooks/useVoiceRecorder'
-import { chatWithAIStream, uploadFile, ApiError, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_LABEL, createConversation, invalidateConversationMessages } from '@/utils/api'
+import {
+  chatWithAIStream,
+  chatRealtimeStream,
+  decodeAudioBlobToPcm16Base64,
+  uploadFile,
+  ApiError,
+  MAX_FILE_SIZE_BYTES,
+  MAX_FILE_SIZE_LABEL,
+  createConversation,
+  invalidateConversationMessages,
+} from '@/utils/api'
 
 /** 超过此条数启用虚拟滚动 */
 const VIRTUAL_SCROLL_THRESHOLD = 30
+
+const REALTIME_PCM_SAMPLE_RATE = 24000 // Realtime 返回 pcm24：24k 16bit 单声道
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
@@ -34,9 +46,18 @@ export default function ChatPage() {
   const [isAiLoading, setIsAiLoading] = useState(false)
   const [pendingImage, setPendingImage] = useState<PendingImage | null>(null)
   const [pendingVoice, setPendingVoice] = useState<PendingVoice | null>(null)
+  const [realtimeMode, setRealtimeMode] = useState(false)
+  const [isDigitalHumanSpeaking, setIsDigitalHumanSpeaking] = useState(false)
+  const [digitalHumanSpeechLevel, setDigitalHumanSpeechLevel] = useState(0)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null)
+  const ttsSpeechIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  /** 实时语音返回的 PCM base64 队列，顺序播放 */
+  const realtimePcmQueueRef = useRef<string[]>([])
+  const realtimePcmPlayingRef = useRef(false)
+  /** 复用同一 AudioContext，避免多实例被浏览器静音 */
+  const realtimeAudioContextRef = useRef<AudioContext | null>(null)
 
-  const user = useChatStore((s) => s.user)
   const messages = useChatStore((s) => s.messages)
   const currentConversationId = useChatStore((s) => s.currentConversationId)
   const addMessage = useChatStore((s) => s.addMessage)
@@ -46,9 +67,132 @@ export default function ChatPage() {
   const updateConversation = useChatStore((s) => s.updateConversation)
   const toast = useToastStore((s) => s.show)
   const { startRecording, stopRecording } = useVoiceRecorder()
-  const userId = user?.id ?? 'guest'
 
   const useVirtualScroll = messages.length >= VIRTUAL_SCROLL_THRESHOLD
+
+  const processRealtimePcmQueue = useCallback(() => {
+    if (realtimePcmPlayingRef.current || realtimePcmQueueRef.current.length === 0) return
+    const b64 = realtimePcmQueueRef.current.shift()!
+    if (!b64 || b64.length < 4) {
+      processRealtimePcmQueue()
+      return
+    }
+    realtimePcmPlayingRef.current = true
+    setIsDigitalHumanSpeaking(true)
+    setDigitalHumanSpeechLevel(0.5)
+    const cleanup = () => {
+      realtimePcmPlayingRef.current = false
+      setIsDigitalHumanSpeaking(false)
+      setDigitalHumanSpeechLevel(0)
+      processRealtimePcmQueue()
+    }
+    try {
+      const binary = atob(b64)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+      let numSamples: number
+      let float32: Float32Array
+      // pcm24：官方为 24kHz 16bit；若为 24bit（3 字节/采样）也支持
+      if (bytes.length % 3 === 0 && bytes.length % 2 !== 0) {
+        numSamples = bytes.length / 3
+        float32 = new Float32Array(numSamples)
+        for (let i = 0; i < numSamples; i++) {
+          const j = i * 3
+          let n = bytes[j]! | (bytes[j + 1]! << 8) | (bytes[j + 2]! << 16)
+          if (n & 0x800000) n -= 0x1000000
+          float32[i] = n / 8388608
+        }
+      } else {
+        numSamples = Math.floor(bytes.length / 2)
+        if (numSamples === 0) {
+          cleanup()
+          return
+        }
+        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, numSamples)
+        float32 = new Float32Array(numSamples)
+        for (let i = 0; i < numSamples; i++) {
+          const s = int16[i]!
+          float32[i] = s < 0 ? s / 0x8000 : s / 0x7fff
+        }
+      }
+      let ctx = realtimeAudioContextRef.current
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({ sampleRate: REALTIME_PCM_SAMPLE_RATE })
+        realtimeAudioContextRef.current = ctx
+      }
+      const doPlay = () => {
+        try {
+          const buffer = ctx!.createBuffer(1, numSamples, REALTIME_PCM_SAMPLE_RATE)
+          buffer.getChannelData(0)!.set(float32)
+          const source = ctx!.createBufferSource()
+          source.buffer = buffer
+          source.connect(ctx!.destination)
+          source.onended = cleanup
+          source.addEventListener('error', cleanup)
+          source.start(0)
+        } catch (e) {
+          cleanup()
+        }
+      }
+      if (ctx.state === 'suspended') {
+        ctx.resume().then(doPlay).catch(cleanup)
+      } else {
+        doPlay()
+      }
+    } catch {
+      cleanup()
+    }
+  }, [])
+
+  /** 将 Realtime 返回的 PCM base64 入队并顺序播放（24k 16bit 单声道） */
+  const playRealtimePcmBase64 = useCallback((base64: string) => {
+    if (!base64) return
+    realtimePcmQueueRef.current.push(base64)
+    processRealtimePcmQueue()
+  }, [processRealtimePcmQueue])
+
+  /** 点击数字人：切换实时对话模式（开启后发送语音走 Realtime，文字与语音同步输出） */
+  const handleDigitalHumanClick = useCallback(() => {
+    const next = !realtimeMode
+    setRealtimeMode(next)
+    if (!next) {
+      realtimePcmQueueRef.current = []
+      realtimePcmPlayingRef.current = false
+      try {
+        realtimeAudioContextRef.current?.close()
+      } catch {
+        // ignore
+      }
+      realtimeAudioContextRef.current = null
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause()
+        ttsAudioRef.current = null
+      }
+      if (ttsSpeechIntervalRef.current) {
+        clearInterval(ttsSpeechIntervalRef.current)
+        ttsSpeechIntervalRef.current = null
+      }
+      setIsDigitalHumanSpeaking(false)
+      setDigitalHumanSpeechLevel(0)
+      toast('已关闭实时对话')
+      return
+    }
+    toast('已开启实时对话，发送语音将同步输出文字与数字人播报')
+  }, [realtimeMode, toast])
+
+  // 组件卸载时清理语音播放
+  useEffect(() => {
+    return () => {
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause()
+        ttsAudioRef.current = null
+      }
+      if (ttsSpeechIntervalRef.current) {
+        clearInterval(ttsSpeechIntervalRef.current)
+        ttsSpeechIntervalRef.current = null
+      }
+    }
+  }, [])
 
   // 消息已由服务端持久化，无需再写 localStorage
 
@@ -64,7 +208,7 @@ export default function ChatPage() {
     const hasVoice = pendingVoice != null
     if ((!content && !hasImage && !hasVoice) || isAiLoading) return
 
-    // 优先处理：仅发送语音（与传文件一样：先展示再发送）
+    // 优先处理：仅发送语音
     if (hasVoice && !hasImage) {
       const voiceToSend = pendingVoice!
       if (!voiceToSend.blob || voiceToSend.blob.size === 0) {
@@ -73,57 +217,56 @@ export default function ChatPage() {
       }
       setPendingVoice(null)
       URL.revokeObjectURL(voiceToSend.url)
-      const file = new File([voiceToSend.blob], voiceToSend.fileName, {
-        type: voiceToSend.blob.type || 'audio/webm',
-      })
       const convId = await ensureConversation()
       setIsAiLoading(true)
       const aiMsgId = generateId()
+      const userMsg: Message = {
+        id: generateId(),
+        content: '[语音]',
+        sender: 'user',
+        timestamp: new Date(),
+        type: 'voice',
+      }
+      addMessage(userMsg)
+      addMessage({
+        id: aiMsgId,
+        content: '',
+        sender: 'ai',
+        timestamp: new Date(),
+        type: 'text',
+      })
+      updateConversation(convId, { lastMessage: userMsg.content, updatedAt: new Date(), messageCount: messages.length + 1 })
       try {
-        const { url, fileName: name, category } = await uploadFile(file)
-        const msgType: Message['type'] = category === 'voice' ? 'voice' : category === 'video' ? 'video' : 'file'
-        const userMsg: Message = {
-          id: generateId(),
-          content: `[语音] ${name}`,
-          sender: 'user',
-          timestamp: new Date(),
-          type: msgType,
-          fileUrl: url,
-          fileName: name,
-        }
-        addMessage(userMsg)
-        addMessage({
-          id: aiMsgId,
-          content: '',
-          sender: 'ai',
-          timestamp: new Date(),
-          type: 'text',
-        })
-        updateConversation(convId, { lastMessage: userMsg.content, updatedAt: new Date(), messageCount: messages.length + 1 })
-        const hint = `用户发送了一条语音，文件名：${name}，请简单回复。`
-        await chatWithAIStream(
-          convId,
-          hint,
-          (chunk) => {
+        if (realtimeMode) {
+          const pcmBase64 = await decodeAudioBlobToPcm16Base64(voiceToSend.blob)
+          await chatRealtimeStream(
+            convId,
+            pcmBase64,
+            (delta) => {
+              const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
+              updateMessage(aiMsgId, { content: (prev?.content ?? '') + delta })
+            },
+            (base64) => playRealtimePcmBase64(base64)
+          )
+        } else {
+          const file = new File([voiceToSend.blob], voiceToSend.fileName, {
+            type: voiceToSend.blob.type || 'audio/webm',
+          })
+          const { fileName: name } = await uploadFile(file)
+          const hint = `用户发送了一条语音，文件名：${name}，请简单回复。`
+          await chatWithAIStream(convId, hint, (chunk) => {
             const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
             updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
-          },
-          { attachmentHint: hint }
-        )
+          }, { attachmentHint: hint })
+        }
         invalidateConversationMessages(convId)
       } catch (err) {
         const msg =
           err instanceof ApiError
-            ? (err.message || '语音上传或 AI 回复失败')
+            ? (err.message || '语音处理或 AI 回复失败')
             : (err instanceof Error ? err.message : '网络异常，请检查后端服务与网络后重试')
         toast(msg)
-        addMessage({
-          id: generateId(),
-          content: `[请求失败] ${msg}`,
-          sender: 'ai',
-          timestamp: new Date(),
-          type: 'text',
-        })
+        updateMessage(aiMsgId, { content: `[请求失败] ${msg}` })
       } finally {
         setIsAiLoading(false)
       }
@@ -163,16 +306,16 @@ export default function ChatPage() {
     })
 
     try {
-        await chatWithAIStream(
-          convId,
-          displayContent,
-          (chunk) => {
-            const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
-            updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
-          },
-          hasImage && imageToSend ? { imageUrl: imageToSend.url } : undefined
+      await chatWithAIStream(
+        convId,
+        displayContent,
+        (chunk) => {
+          const prev = useChatStore.getState().messages.find((m) => m.id === aiMsgId)
+          updateMessage(aiMsgId, { content: (prev?.content ?? '') + chunk })
+        },
+        hasImage && imageToSend ? { imageUrl: imageToSend.url } : undefined
       )
-        invalidateConversationMessages(convId)
+      invalidateConversationMessages(convId)
     } catch (err) {
       const msg = err instanceof ApiError ? err.message : 'AI 回复失败，请稍后重试'
       toast(msg)
@@ -299,8 +442,12 @@ export default function ChatPage() {
       <aside className="hidden md:flex flex-col flex-shrink-0 w-56 lg:w-60 xl:w-72 border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 items-center justify-center p-3 md:p-4 landscape:max-md:hidden">
         <DigitalHuman
           expression="neutral"
+          isSpeaking={isDigitalHumanSpeaking}
+          speechLevel={digitalHumanSpeechLevel}
           animate
           bodyMotion
+          onClick={handleDigitalHumanClick}
+          realtimeMode={realtimeMode}
           className="w-full max-w-[180px] md:max-w-[200px]"
         />
       </aside>

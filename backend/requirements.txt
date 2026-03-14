@@ -2,3 +2,4 @@ flask>=2.0.0
 flask-cors>=4.0.0
 requests>=2.25.0
 pymysql>=1.0.0
+websocket-client>=1.0.0

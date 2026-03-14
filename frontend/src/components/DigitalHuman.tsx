@@ -14,6 +14,10 @@ interface DigitalHumanProps {
   animate?: boolean
   /** 是否启用肢体动作 */
   bodyMotion?: boolean
+  /** 点击数字人触发，例如开启实时对话 */
+  onClick?: () => void
+  /** 是否处于实时对话模式，用于展示提示文案 */
+  realtimeMode?: boolean
   className?: string
 }
 
@@ -65,6 +69,8 @@ export default function DigitalHuman({
   speechLevel = 0,
   animate = true,
   bodyMotion = true,
+  onClick,
+  realtimeMode = false,
   className,
 }: DigitalHumanProps) {
   const [blink, setBlink] = useState(false)
@@ -113,7 +119,28 @@ export default function DigitalHuman({
   const eyeClose = blink ? 0.15 : 1
 
   return (
-    <div className={clsx('flex flex-col items-center justify-center w-full', className)}>
+    <div
+      className={clsx(
+        'flex flex-col items-center justify-center w-full',
+        onClick &&
+          'cursor-pointer select-none hover:opacity-90 active:scale-[0.98] transition-transform',
+        className
+      )}
+      onClick={onClick}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      title={onClick ? (realtimeMode ? '点击关闭实时对话' : '点击开启实时对话') : undefined}
+      onKeyDown={
+        onClick
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                onClick()
+              }
+            }
+          : undefined
+      }
+    >
       <svg
         viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
         className="w-full h-auto max-w-[140px] max-h-[168px] sm:max-w-[160px] sm:max-h-[192px] md:max-w-[180px] md:max-h-[216px] lg:max-w-[200px] lg:max-h-[240px] portrait:max-h-[200px] landscape:max-md:max-h-[140px]"
@@ -249,7 +276,14 @@ export default function DigitalHuman({
           </g>
         </g>
       </svg>
-      <p className="mt-1 sm:mt-2 text-xs sm:text-sm text-gray-500 dark:text-gray-400">数字人助手</p>
+      <p className="mt-1 sm:mt-2 text-xs sm:text-sm text-gray-500 dark:text-gray-400">
+        {realtimeMode ? '实时对话已开启 · 回复将语音播报' : '数字人助手'}
+      </p>
+      {onClick && !realtimeMode && (
+        <p className="mt-0.5 text-[11px] sm:text-xs text-primary-500 dark:text-primary-400">
+          点击开启实时对话
+        </p>
+      )}
     </div>
   )
 }
