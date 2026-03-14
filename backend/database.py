@@ -298,6 +298,159 @@ def get_conversation_owner(conversation_id: int) -> Optional[int]:
             return row["user_id"] if row else None
 
 
+# ---------- 情绪异常记录（存原因，供模型检索与对症疏导） ----------
+
+
+def create_emotion_anomalies_table():
+    """情绪异常表：对话/监控发现异常时写入。from_monitoring 0=聊天 1=监控；聊天时可存 reason。"""
+    sql = """
+    CREATE TABLE IF NOT EXISTS emotion_anomalies (
+      id             INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      user_id        INT          NOT NULL,
+      emotion_label  VARCHAR(64)  NOT NULL COMMENT '情绪标签',
+      reason         TEXT         NULL COMMENT '具体原因（来自聊天时填写，来自监控可空）',
+      from_monitoring TINYINT     NOT NULL DEFAULT 0 COMMENT '0=聊天 1=监控',
+      created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_user_created (user_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='情绪异常记录'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def _ensure_from_monitoring_column():
+    """已有表补加 from_monitoring 列（兼容旧库）；若有 source 列则按 source 回填。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'emotion_anomalies' AND COLUMN_NAME = 'from_monitoring'"""
+            )
+            if cur.fetchone()["n"] == 0:
+                cur.execute(
+                    "ALTER TABLE emotion_anomalies ADD COLUMN from_monitoring TINYINT NOT NULL DEFAULT 0 COMMENT '0=聊天 1=监控' AFTER reason"
+                )
+                try:
+                    cur.execute("UPDATE emotion_anomalies SET from_monitoring = 1 WHERE source = 'monitoring'")
+                except Exception:
+                    pass
+        conn.commit()
+
+
+def add_emotion_anomaly(user_id: int, emotion_label: str, reason: str = "", from_monitoring: int = 0) -> int:
+    """写入一条情绪异常。from_monitoring: 0=聊天（可填 reason），1=监控。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO emotion_anomalies (user_id, emotion_label, reason, from_monitoring)
+                   VALUES (%s, %s, %s, %s)""",
+                (user_id, (emotion_label or "").strip()[:64], (reason or "").strip()[:2000] or None, 1 if from_monitoring else 0),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def get_emotion_anomalies_by_user(user_id: int, limit: int = 100, since_days: Optional[int] = None) -> list:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if since_days is not None and since_days > 0:
+                cur.execute(
+                    """SELECT id, user_id, emotion_label, reason, from_monitoring, created_at
+                       FROM emotion_anomalies WHERE user_id = %s AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)
+                       ORDER BY created_at DESC LIMIT %s""",
+                    (user_id, since_days, max(1, limit)),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, user_id, emotion_label, reason, from_monitoring, created_at
+                       FROM emotion_anomalies WHERE user_id = %s ORDER BY created_at DESC LIMIT %s""",
+                    (user_id, max(1, limit)),
+                )
+            return cur.fetchall()
+
+
+def count_recent_anomalies(user_id: int, days: int = 7) -> int:
+    """最近 N 天内异常次数，用于触发「多次异常则主动疏导」。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM emotion_anomalies
+                   WHERE user_id = %s AND created_at >= DATE_SUB(NOW(), INTERVAL %s DAY)""",
+                (user_id, max(1, days)),
+            )
+            row = cur.fetchone()
+            return int(row["n"]) if row else 0
+
+
+# ---------- 主动疏导触发（监控/多次异常后由数字人主动发起） ----------
+
+
+def create_proactive_triggers_table():
+    sql = """
+    CREATE TABLE IF NOT EXISTS proactive_triggers (
+      id             INT      NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      user_id        INT      NOT NULL,
+      trigger_type   VARCHAR(32) NOT NULL DEFAULT 'monitoring' COMMENT 'monitoring|repeated_anomaly',
+      acknowledged_at DATETIME NULL COMMENT '用户已响应时间',
+      created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_user_pending (user_id, acknowledged_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='主动疏导触发记录'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def create_proactive_trigger(user_id: int, trigger_type: str = "monitoring") -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO proactive_triggers (user_id, trigger_type) VALUES (%s, %s)",
+                (user_id, (trigger_type or "monitoring")[:32]),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def get_pending_proactive_trigger(user_id: int) -> Optional[dict]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, user_id, trigger_type, created_at FROM proactive_triggers
+                   WHERE user_id = %s AND acknowledged_at IS NULL ORDER BY created_at DESC LIMIT 1""",
+                (user_id,),
+            )
+            return cur.fetchone()
+
+
+def acknowledge_proactive_trigger(trigger_id: int, user_id: int) -> bool:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE proactive_triggers SET acknowledged_at = CURRENT_TIMESTAMP WHERE id = %s AND user_id = %s",
+                (trigger_id, user_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def get_emotion_stats_by_user(user_id: int, days: int = 30) -> list:
+    """按日聚合情绪异常数量，供情感曲线。返回 [{"date": "YYYY-MM-DD", "count": n}, ...]。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT DATE(created_at) AS date, COUNT(*) AS count
+                   FROM emotion_anomalies WHERE user_id = %s AND created_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+                   GROUP BY DATE(created_at) ORDER BY date ASC""",
+                (user_id, max(1, days)),
+            )
+            rows = cur.fetchall()
+    return [{"date": (r["date"].isoformat() if hasattr(r["date"], "isoformat") else str(r["date"])), "count": r["count"]} for r in rows]
+
+
 # ---------- 用户日程（从对话提取或手动添加） ----------
 
 
@@ -403,9 +556,12 @@ def init_db():
     create_emotion_labels_table()
     create_conversations_table()
     create_messages_table()
+    create_emotion_anomalies_table()
+    _ensure_from_monitoring_column()
+    create_proactive_triggers_table()
     create_user_schedules_table()
 
 
 if __name__ == "__main__":
     init_db()
-    print("users 表、emotion_labels、conversations、messages、user_schedules 已创建或已存在。")
+    print("users、emotion_labels、conversations、messages、emotion_anomalies、proactive_triggers、user_schedules 已创建或已存在。")

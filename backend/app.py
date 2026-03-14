@@ -31,6 +31,10 @@ from config import (
 )
 import database as db
 
+# 情绪异常判定阈值：最近 N 天内达到此次数则创建「主动疏导」触发
+PROACTIVE_ANOMALY_THRESHOLD = 3
+PROACTIVE_ANOMALY_DAYS = 7
+
 # 单文件上传最大 10MB，与前端一致；超过时请求被拒绝
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -237,6 +241,48 @@ def _extract_schedules_from_text(user_id: int, text: str) -> list:
                 pass
             return created
     return created
+
+
+def _detect_emotion_anomaly(user_id: int, user_text: str) -> None:
+    """用模型判断用户输入是否情绪异常，若异常则写入 emotion_anomalies 并检查是否触发主动疏导。"""
+    if not (user_text or "").strip() or not API_KEY:
+        return
+    try:
+        payload = {
+            "model": CHAT_MODEL,
+            "messages": [
+                {"role": "system", "content": "你只输出一段 JSON，不要其他内容。判断用户这句话是否表现出明显情绪异常（如焦虑、抑郁、愤怒、崩溃等）。若异常则输出：{\"is_abnormal\":true,\"emotion_label\":\"异常类型\",\"reason\":\"简短原因\"}；否则输出：{\"is_abnormal\":false}。"},
+                {"role": "user", "content": (user_text or "")[:1500]},
+            ],
+            "max_tokens": 200,
+            "stream": False,
+        }
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+        r = requests.post(CHAT_API_URL, json=payload, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return
+        out = r.json()
+        text = (out.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        if not text:
+            return
+        for raw in (text, text.replace("```json", "").replace("```", "").strip()):
+            try:
+                obj = json.loads(raw)
+                if obj.get("is_abnormal") and obj.get("emotion_label"):
+                    db.add_emotion_anomaly(
+                        int(user_id),
+                        (obj.get("emotion_label") or "异常")[:64],
+                        reason=(obj.get("reason") or "")[:2000],
+                        from_monitoring=0,
+                    )
+                    n = db.count_recent_anomalies(int(user_id), days=PROACTIVE_ANOMALY_DAYS)
+                    if n >= PROACTIVE_ANOMALY_THRESHOLD:
+                        db.create_proactive_trigger(int(user_id), "repeated_anomaly")
+                break
+            except (json.JSONDecodeError, TypeError):
+                continue
+    except Exception:
+        pass
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -492,6 +538,7 @@ def chat_stream():
                 ai_content = "".join(full_content).strip() or "（无回复）"
                 db.create_message(conv_id, "assistant", ai_content, "text", None, None)
                 db.update_conversation_last_message(conv_id, ai_content)
+                _detect_emotion_anomaly(int(user_id), user_content)
                 _extract_schedules_from_text(int(user_id), user_content)
                 yield "data: [DONE]\n\n"
             except requests.RequestException as e:
@@ -519,6 +566,114 @@ def chat_stream():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# ---------- 情绪异常与主动疏导（个人中心情感曲线、事件记录、主动疏导入口） ----------
+
+
+def _anomaly_row_to_json(row):
+    if not row:
+        return None
+    from_mon = 1 if row.get("from_monitoring") else 0
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "emotion_label": row["emotion_label"],
+        "reason": (row.get("reason") or "").strip(),
+        "from_monitoring": from_mon,
+        "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
+    }
+
+
+@app.route("/api/emotion/anomaly", methods=["POST"])
+def emotion_anomaly_add():
+    """记录一条情绪异常（聊天或监控写入）。body: { emotion_label, reason?, from_monitoring? }。from_monitoring: 0=聊天（可带 reason），1=监控。为 1 时创建主动疏导触发。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    label = (data.get("emotion_label") or data.get("label") or "").strip()
+    if not label:
+        return _err("请输入情绪标签")
+    reason = (data.get("reason") or "").strip()[:2000]
+    from_monitoring = 0
+    if data.get("from_monitoring") in (1, "1", True):
+        from_monitoring = 1
+    elif (data.get("source") or "").strip().lower() == "monitoring":
+        from_monitoring = 1
+    try:
+        aid = db.add_emotion_anomaly(int(user_id), label, reason=reason, from_monitoring=from_monitoring)
+        if from_monitoring == 1:
+            db.create_proactive_trigger(int(user_id), "monitoring")
+        row = db.get_emotion_anomalies_by_user(int(user_id), limit=1)
+        return jsonify(_anomaly_row_to_json(row[0]) if row else {"id": aid, "emotion_label": label, "reason": reason, "from_monitoring": from_monitoring})
+    except Exception as e:
+        return _err("保存失败: " + str(e), 500)
+
+
+@app.route("/api/emotion/anomalies", methods=["GET"])
+def emotion_anomalies_list():
+    """当前用户情绪异常列表，供个人中心与模型检索。query: limit, since_days"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        limit = request.args.get("limit", type=int) or 100
+        since_days = request.args.get("since_days", type=int)
+        rows = db.get_emotion_anomalies_by_user(int(user_id), limit=min(max(1, limit), 500), since_days=since_days)
+        return jsonify([_anomaly_row_to_json(r) for r in rows])
+    except Exception as e:
+        return _err("查询失败: " + str(e), 500)
+
+
+@app.route("/api/emotion/stats", methods=["GET"])
+def emotion_stats():
+    """情绪统计：按日聚合数量，供可视化情感曲线。query: days 默认 30"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        days = min(max(1, request.args.get("days", type=int) or 30), 365)
+        rows = db.get_emotion_stats_by_user(int(user_id), days=days)
+        return jsonify(rows)
+    except Exception as e:
+        return _err("查询失败: " + str(e), 500)
+
+
+@app.route("/api/proactive/pending", methods=["GET"])
+def proactive_pending():
+    """当前用户是否有待响应的主动疏导（监控检测到异常 / 多次异常）。"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    try:
+        row = db.get_pending_proactive_trigger(int(user_id))
+        if not row:
+            return jsonify(None)
+        return jsonify({
+            "id": row["id"],
+            "trigger_type": row["trigger_type"],
+            "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
+        })
+    except Exception as e:
+        return _err("查询失败: " + str(e), 500)
+
+
+@app.route("/api/proactive/ack", methods=["POST"])
+def proactive_ack():
+    """用户点击「去聊天」后确认已响应。body: { triggerId }"""
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    tid = data.get("triggerId") or data.get("trigger_id")
+    if tid is None:
+        return _err("缺少 triggerId")
+    try:
+        ok = db.acknowledge_proactive_trigger(int(tid), int(user_id))
+        return jsonify({"ok": ok})
+    except Exception as e:
+        return _err("操作失败: " + str(e), 500)
 
 
 # ---------- 日程（个人中心用） ----------
