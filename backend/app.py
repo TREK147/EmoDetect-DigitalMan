@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import uuid
+import numpy as np
 import requests
 import websocket
 from flask import Flask, request, jsonify, Response, send_from_directory
@@ -30,6 +31,7 @@ from config import (
     DOUBAO_TTS_DEFAULT_VOICE,
 )
 import database as db
+from face_engine import get_engine
 
 # 情绪异常判定阈值：最近 N 天内达到此次数则创建「主动疏导」触发
 PROACTIVE_ANOMALY_THRESHOLD = 3
@@ -566,6 +568,177 @@ def chat_stream():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+# ---------- 人脸识别 + 情绪识别（来自 gui_app2.py 能力后端化） ----------
+
+
+def _student_row_to_json(row):
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "student_id": row["student_id"],
+        "name": row["name"],
+        "has_face_feature": bool(row.get("face_feature")),
+        "is_deleted": int(row.get("is_deleted") or 0),
+        "deleted_at": row["deleted_at"].isoformat() if row.get("deleted_at") and hasattr(row["deleted_at"], "isoformat") else (str(row.get("deleted_at")) if row.get("deleted_at") else None),
+        "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
+        "updated_at": row["updated_at"].isoformat() if hasattr(row.get("updated_at"), "isoformat") else str(row.get("updated_at", "")),
+    }
+
+
+def _record_row_to_json(row):
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "student_id": row["student_id"],
+        "emotion_type": row["emotion_type"],
+        "intensity": float(row.get("intensity") or 0),
+        "timestamp": row["timestamp"].isoformat() if hasattr(row.get("timestamp"), "isoformat") else str(row.get("timestamp", "")),
+        "is_deleted": int(row.get("is_deleted") or 0),
+        "deleted_at": row["deleted_at"].isoformat() if row.get("deleted_at") and hasattr(row["deleted_at"], "isoformat") else (str(row.get("deleted_at")) if row.get("deleted_at") else None),
+    }
+
+
+def _load_face_db_embeddings():
+    face_db = {}
+    rows = db.list_students(include_deleted=False, limit=5000)
+    for row in rows:
+        raw = row.get("face_feature")
+        if not raw:
+            continue
+        try:
+            face_db[row["student_id"]] = np.array(json.loads(raw), dtype=np.float32)
+        except Exception:
+            continue
+    return face_db
+
+
+@app.route("/api/face/students", methods=["GET"])
+def list_face_students():
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    include_deleted = request.args.get("include_deleted") in ("1", "true", "True")
+    limit = min(max(1, request.args.get("limit", type=int) or 200), 1000)
+    rows = db.list_students(include_deleted=include_deleted, limit=limit)
+    return jsonify([_student_row_to_json(r) for r in rows])
+
+
+@app.route("/api/face/students", methods=["POST"])
+def create_or_register_face_student():
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    student_id = (data.get("student_id") or data.get("studentId") or "").strip()
+    name = (data.get("name") or "").strip()
+    image_base64 = (data.get("image_base64") or data.get("imageBase64") or "").strip()
+    if not student_id or not name:
+        return _err("请传入 student_id 和 name")
+
+    face_feature_json = None
+    if image_base64:
+        engine = get_engine()
+        frame = engine.decode_base64_image(image_base64)
+        if frame is None:
+            return _err("图片解析失败，请检查 image_base64 格式")
+        emb = engine.extract_embedding(frame)
+        if emb is None:
+            return _err("未检测到清晰正脸，暂无法注册人脸")
+        face_feature_json = json.dumps(emb.tolist())
+    db.upsert_student(student_id, name, face_feature_json=face_feature_json)
+    row = db.get_student_by_student_id(student_id, include_deleted=True)
+    return jsonify(_student_row_to_json(row))
+
+
+@app.route("/api/face/students/<student_id>", methods=["PATCH"])
+def patch_face_student(student_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    name = data.get("name")
+    ok = db.update_student(student_id, name=name)
+    if not ok:
+        return _err("学生不存在", 404)
+    row = db.get_student_by_student_id(student_id, include_deleted=False)
+    return jsonify(_student_row_to_json(row))
+
+
+@app.route("/api/face/students/<student_id>", methods=["DELETE"])
+def delete_face_student(student_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    ok = db.soft_delete_student(student_id)
+    if not ok:
+        return _err("学生不存在或已删除", 404)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/face/recognize", methods=["POST"])
+def face_recognize_once():
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    data = request.get_json(force=True, silent=True) or {}
+    image_base64 = (data.get("image_base64") or data.get("imageBase64") or "").strip()
+    threshold = float(data.get("threshold") or 0.6)
+    if not image_base64:
+        return _err("缺少 image_base64")
+
+    engine = get_engine()
+    frame = engine.decode_base64_image(image_base64)
+    if frame is None:
+        return _err("图片解析失败")
+
+    face_db = _load_face_db_embeddings()
+    detections = engine.detect(frame, face_db, threshold=threshold)
+    for d in detections:
+        if d.student_id != "unknown":
+            db.add_emotion_record(d.student_id, d.emotion, d.confidence)
+
+    return jsonify(
+        {
+            "width": int(frame.shape[1]),
+            "height": int(frame.shape[0]),
+            "count": len(detections),
+            "detections": [
+                {
+                    "student_id": d.student_id,
+                    "emotion": d.emotion,
+                    "confidence": d.confidence,
+                    "box": d.box,
+                }
+                for d in detections
+            ],
+        }
+    )
+
+
+@app.route("/api/face/records", methods=["GET"])
+def list_face_records():
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    student_id = request.args.get("student_id")
+    limit = min(max(1, request.args.get("limit", type=int) or 200), 1000)
+    rows = db.list_emotion_records(student_id=student_id, limit=limit)
+    return jsonify([_record_row_to_json(r) for r in rows])
+
+
+@app.route("/api/face/records/<int:record_id>", methods=["DELETE"])
+def delete_face_record(record_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    ok = db.soft_delete_emotion_record(record_id)
+    if not ok:
+        return _err("记录不存在或已删除", 404)
+    return jsonify({"ok": True})
 
 
 # ---------- 情绪异常与主动疏导（个人中心情感曲线、事件记录、主动疏导入口） ----------

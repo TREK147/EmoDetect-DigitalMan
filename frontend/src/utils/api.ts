@@ -730,3 +730,80 @@ export async function updateSchedule(
 export async function deleteSchedule(id: number): Promise<void> {
   await client.delete(`/schedules/${id}`)
 }
+
+// ---------- 人脸识别 + 情绪识别 ----------
+
+export interface FaceStudent {
+  id: number
+  student_id: string
+  name: string
+  has_face_feature: boolean
+  is_deleted: number
+  deleted_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface FaceDetection {
+  student_id: string
+  emotion: string
+  confidence: number
+  box: [number, number, number, number]
+}
+
+export interface FaceRecognizeResponse {
+  width: number
+  height: number
+  count: number
+  detections: FaceDetection[]
+}
+
+export interface FaceRecord {
+  id: number
+  student_id: string
+  emotion_type: string
+  intensity: number
+  timestamp: string
+  is_deleted: number
+  deleted_at: string | null
+}
+
+export async function listFaceStudents(params?: { include_deleted?: boolean; limit?: number }): Promise<FaceStudent[]> {
+  const res = await client.get<FaceStudent[]>('/face/students', { params: params ?? {} })
+  return res.data ?? []
+}
+
+export async function registerFaceStudent(data: {
+  student_id: string
+  name: string
+  image_base64?: string
+}): Promise<FaceStudent> {
+  const res = await client.post<FaceStudent>('/face/students', data)
+  return res.data
+}
+
+export async function updateFaceStudent(studentId: string, patch: { name?: string }): Promise<FaceStudent> {
+  const res = await client.patch<FaceStudent>(`/face/students/${encodeURIComponent(studentId)}`, patch)
+  return res.data
+}
+
+export async function deleteFaceStudent(studentId: string): Promise<void> {
+  await client.delete(`/face/students/${encodeURIComponent(studentId)}`)
+}
+
+export async function recognizeFaceImage(data: {
+  image_base64: string
+  threshold?: number
+}): Promise<FaceRecognizeResponse> {
+  const res = await client.post<FaceRecognizeResponse>('/face/recognize', data, { timeout: 60000 })
+  return res.data
+}
+
+export async function listFaceRecords(params?: { student_id?: string; limit?: number }): Promise<FaceRecord[]> {
+  const res = await client.get<FaceRecord[]>('/face/records', { params: params ?? {} })
+  return res.data ?? []
+}
+
+export async function deleteFaceRecord(recordId: number): Promise<void> {
+  await client.delete(`/face/records/${recordId}`)
+}

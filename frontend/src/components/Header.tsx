@@ -7,6 +7,7 @@ import {
   User,
   LogOut,
   ChevronDown,
+  Camera,
 } from 'lucide-react'
 import type { User as UserType } from '@/types'
 import { useChatStore } from '@/stores/useChatStore'
@@ -66,6 +67,13 @@ export default function Header({
       </div>
 
       <nav className="flex items-center gap-1 sm:gap-2">
+        <Link
+          to="/chat/face-monitor"
+          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs sm:text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+        >
+          <Camera className="w-4 h-4" />
+          人脸情绪
+        </Link>
         <button
           type="button"
           onClick={onSettingsClick}

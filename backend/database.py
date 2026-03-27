@@ -476,6 +476,228 @@ def create_user_schedules_table():
         conn.commit()
 
 
+def create_students_table():
+    """创建学生表（用于人脸库），支持逻辑删除。"""
+    sql = """
+    CREATE TABLE IF NOT EXISTS student (
+      id            INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      student_id    VARCHAR(64)  NOT NULL COMMENT '学号（唯一）',
+      name          VARCHAR(100) NOT NULL COMMENT '姓名',
+      face_feature  LONGTEXT     NULL COMMENT '人脸特征向量（JSON）',
+      is_deleted    TINYINT      NOT NULL DEFAULT 0 COMMENT '逻辑删除标记 0/1',
+      deleted_at    DATETIME     NULL COMMENT '逻辑删除时间',
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_student_id (student_id),
+      KEY idx_student_deleted (is_deleted)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学生人脸库'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def create_emotion_records_table():
+    """创建识别记录表，支持逻辑删除。"""
+    sql = """
+    CREATE TABLE IF NOT EXISTS emotion_record (
+      id            BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      student_id    VARCHAR(64)  NOT NULL COMMENT '学号',
+      emotion_type  VARCHAR(64)  NOT NULL COMMENT '情绪标签',
+      intensity     DECIMAL(5,2) NOT NULL COMMENT '情绪置信度',
+      timestamp     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录时间',
+      is_deleted    TINYINT      NOT NULL DEFAULT 0 COMMENT '逻辑删除标记 0/1',
+      deleted_at    DATETIME     NULL COMMENT '逻辑删除时间',
+      KEY idx_record_student_time (student_id, timestamp),
+      KEY idx_record_deleted (is_deleted)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学生情绪识别记录'
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def _ensure_soft_delete_columns(table_name: str):
+    """兼容旧表：补齐 is_deleted / deleted_at 字段。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = 'is_deleted'""",
+                (table_name,),
+            )
+            if cur.fetchone()["n"] == 0:
+                cur.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN is_deleted TINYINT NOT NULL DEFAULT 0 COMMENT '逻辑删除标记 0/1'"
+                )
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = 'deleted_at'""",
+                (table_name,),
+            )
+            if cur.fetchone()["n"] == 0:
+                cur.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN deleted_at DATETIME NULL COMMENT '逻辑删除时间'"
+                )
+        conn.commit()
+
+
+def upsert_student(student_id: str, name: str, face_feature_json: Optional[str] = None) -> None:
+    """新增或更新学生（若已逻辑删除会恢复）。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if face_feature_json is None:
+                cur.execute(
+                    """INSERT INTO student (student_id, name, is_deleted, deleted_at)
+                       VALUES (%s, %s, 0, NULL)
+                       ON DUPLICATE KEY UPDATE
+                       name = VALUES(name),
+                       is_deleted = 0,
+                       deleted_at = NULL""",
+                    ((student_id or "").strip(), (name or "").strip()[:100]),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO student (student_id, name, face_feature, is_deleted, deleted_at)
+                       VALUES (%s, %s, %s, 0, NULL)
+                       ON DUPLICATE KEY UPDATE
+                       name = VALUES(name),
+                       face_feature = VALUES(face_feature),
+                       is_deleted = 0,
+                       deleted_at = NULL""",
+                    ((student_id or "").strip(), (name or "").strip()[:100], face_feature_json),
+                )
+        conn.commit()
+
+
+def list_students(include_deleted: bool = False, limit: int = 200) -> list:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if include_deleted:
+                cur.execute(
+                    """SELECT id, student_id, name, face_feature, is_deleted, deleted_at, created_at, updated_at
+                       FROM student ORDER BY updated_at DESC LIMIT %s""",
+                    (max(1, limit),),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, student_id, name, face_feature, is_deleted, deleted_at, created_at, updated_at
+                       FROM student WHERE is_deleted = 0 ORDER BY updated_at DESC LIMIT %s""",
+                    (max(1, limit),),
+                )
+            return cur.fetchall()
+
+
+def get_student_by_student_id(student_id: str, include_deleted: bool = False) -> Optional[dict]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if include_deleted:
+                cur.execute(
+                    """SELECT id, student_id, name, face_feature, is_deleted, deleted_at, created_at, updated_at
+                       FROM student WHERE student_id = %s LIMIT 1""",
+                    ((student_id or "").strip(),),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, student_id, name, face_feature, is_deleted, deleted_at, created_at, updated_at
+                       FROM student WHERE student_id = %s AND is_deleted = 0 LIMIT 1""",
+                    ((student_id or "").strip(),),
+                )
+            return cur.fetchone()
+
+
+def soft_delete_student(student_id: str) -> bool:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE student
+                   SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP
+                   WHERE student_id = %s AND is_deleted = 0""",
+                ((student_id or "").strip(),),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def update_student(student_id: str, name: Optional[str] = None) -> bool:
+    updates = []
+    args = []
+    if name is not None:
+        updates.append("name = %s")
+        args.append((name or "").strip()[:100])
+    if not updates:
+        return True
+    args.extend([(student_id or "").strip()])
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE student SET " + ", ".join(updates) + " WHERE student_id = %s AND is_deleted = 0",
+                tuple(args),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def load_face_database() -> dict:
+    """返回 { student_id: np.array(feature) } 的原始 JSON 结构数据。"""
+    rows = list_students(include_deleted=False, limit=5000)
+    out = {}
+    for row in rows:
+        feature = row.get("face_feature")
+        if feature:
+            out[row["student_id"]] = feature
+    return out
+
+
+def add_emotion_record(student_id: str, emotion_type: str, intensity: float) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO emotion_record (student_id, emotion_type, intensity)
+                   VALUES (%s, %s, %s)""",
+                ((student_id or "").strip(), (emotion_type or "").strip()[:64], float(intensity)),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+
+def list_emotion_records(student_id: Optional[str] = None, limit: int = 200) -> list:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            if student_id:
+                cur.execute(
+                    """SELECT id, student_id, emotion_type, intensity, timestamp, is_deleted, deleted_at
+                       FROM emotion_record
+                       WHERE is_deleted = 0 AND student_id = %s
+                       ORDER BY timestamp DESC LIMIT %s""",
+                    ((student_id or "").strip(), max(1, limit)),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, student_id, emotion_type, intensity, timestamp, is_deleted, deleted_at
+                       FROM emotion_record
+                       WHERE is_deleted = 0
+                       ORDER BY timestamp DESC LIMIT %s""",
+                    (max(1, limit),),
+                )
+            return cur.fetchall()
+
+
+def soft_delete_emotion_record(record_id: int) -> bool:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE emotion_record
+                   SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP
+                   WHERE id = %s AND is_deleted = 0""",
+                (record_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
 def create_schedule(user_id: int, title: str, scheduled_at: str, end_at: Optional[str] = None, source: str = "conversation", raw_text: Optional[str] = None) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -560,6 +782,10 @@ def init_db():
     _ensure_from_monitoring_column()
     create_proactive_triggers_table()
     create_user_schedules_table()
+    create_students_table()
+    create_emotion_records_table()
+    _ensure_soft_delete_columns("student")
+    _ensure_soft_delete_columns("emotion_record")
 
 
 if __name__ == "__main__":

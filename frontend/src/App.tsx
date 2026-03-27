@@ -11,6 +11,7 @@ const LoginPage = lazy(() => import('@/pages/LoginPage'))
 const RegisterPage = lazy(() => import('@/pages/RegisterPage'))
 const ChatPage = lazy(() => import('@/pages/ChatPage'))
 const ProfilePage = lazy(() => import('@/pages/ProfilePage'))
+const FaceMonitorPage = lazy(() => import('@/pages/FaceMonitorPage'))
 
 function PageFallback() {
   return (
@@ -73,6 +74,7 @@ function App() {
           >
             <Route index element={<ChatPage />} />
             <Route path="profile" element={<ProfilePage />} />
+            <Route path="face-monitor" element={<FaceMonitorPage />} />
           </Route>
 
           <Route path="/" element={<Navigate to="/chat" replace />} />

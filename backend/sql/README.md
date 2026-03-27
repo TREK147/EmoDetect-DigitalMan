@@ -18,5 +18,6 @@ mysql -u root -p < backend/sql/init_mysql_user.sql
 
 - `create_users.sql`：用户表
 - `create_emotion_labels.sql`：情绪标签表
+- `migration_legacy_to_v2.sql`：旧版人脸情绪表迁移到当前后端兼容结构（含备份与替换）
 
 应用启动时也会通过 `database.py` 自动创建表，无需单独执行上述建表脚本。
