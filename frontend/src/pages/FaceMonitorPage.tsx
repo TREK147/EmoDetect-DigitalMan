@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import axios from 'axios'
 import {
+  ApiError,
   listFaceStudents,
   recognizeFaceImage,
   registerFaceStudent,
@@ -148,7 +150,15 @@ export default function FaceMonitorPage() {
       setName('')
       await loadStudents()
     } catch (e) {
-      toast('注册失败，请确认当前画面有清晰正脸')
+      const fallback = '注册失败，请确认已登录、后端已启动，且画面中为清晰正脸'
+      if (e instanceof ApiError) {
+        toast(e.message || fallback)
+      } else if (axios.isAxiosError(e)) {
+        const data = e.response?.data as { error?: string } | undefined
+        toast(data?.error ?? (e.message || fallback))
+      } else {
+        toast(fallback)
+      }
     }
   }
 

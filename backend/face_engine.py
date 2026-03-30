@@ -65,7 +65,22 @@ class FaceEmotionEngine:
             face = self.mtcnn(rgb)
             if face is None:
                 return None
-            emb = self.face_model(face.unsqueeze(0).to(self.device)).detach().cpu().numpy()[0]
+            # MTCNN 在 keep_all=True 时，可能返回 [N, 3, 160, 160]。
+            # 此处注册只需要取第一张对齐人脸的 embedding，避免出现 [1, 1, 3, 160, 160] 维度不匹配。
+            # 兼容不同版本 MTCNN 返回类型（有的版本会返回 (faces, probs)）。
+            if isinstance(face, tuple):
+                face = face[0]
+
+            if not isinstance(face, torch.Tensor):
+                return None
+            if face.dim() == 4:
+                face_tensor = face[0]  # -> [3, 160, 160]
+            elif face.dim() == 3:
+                face_tensor = face  # -> [3, 160, 160]
+            else:
+                return None
+
+            emb = self.face_model(face_tensor.unsqueeze(0).to(self.device)).detach().cpu().numpy()[0]
             return emb
 
     def detect(self, frame: np.ndarray, face_db: Dict[str, np.ndarray], threshold: float = 0.6) -> List[DetectionResult]:

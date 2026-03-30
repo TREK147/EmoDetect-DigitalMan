@@ -79,8 +79,14 @@ export class ApiError extends Error {
 function normalizeApiError(err: AxiosError): ApiError {
   const status = err.response?.status
   const data = err.response?.data as { message?: string; error?: string; code?: string } | undefined
-  const message =
+  const noResponse = !err.response
+  const networkHint =
+    '无法连接后端：请在项目 backend 目录执行 python app.py，保持终端不关，并确认 http://127.0.0.1:5000/api/health 能访问'
+  let message =
     data?.message ?? data?.error ?? err.message ?? `请求失败${status ? ` (${status})` : ''}`
+  if (noResponse && (err.code === 'ERR_NETWORK' || err.message === 'Network Error')) {
+    message = networkHint
+  }
   return new ApiError(message, status, data?.code, data)
 }
 
