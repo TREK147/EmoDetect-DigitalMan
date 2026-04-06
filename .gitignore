@@ -36,3 +36,6 @@ Thumbs.db
 # --- 数据库临时文件 ---
 *.sqlite
 *.db
+
+# EmotiEffLib：不纳入仓库，使用 pip install emotiefflib + 运行时下载模型到 ~/.emotiefflib
+EmotiEffLib/
