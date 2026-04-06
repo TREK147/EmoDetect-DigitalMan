@@ -53,6 +53,8 @@ _face_warmup_lock = threading.Lock()
 _face_infer_lock = threading.Lock()
 _face_warmup_state = "idle"  # idle | starting | loading | ready | error
 _face_warmup_error = None  # str | None
+# 仅首条识别请求打印一次说明，避免每次 POST 刷屏（引擎仍只初始化一次）
+_face_recognize_hint_logged = False
 
 # 情绪异常判定阈值：最近 N 天内达到此次数则创建「主动疏导」触发
 PROACTIVE_ANOMALY_THRESHOLD = 3
@@ -787,7 +789,13 @@ def delete_face_student(student_id):
 
 @app.route("/api/face/recognize", methods=["POST"])
 def face_recognize_once():
-    print("[face] POST /api/face/recognize 已开始（若首次加载模型，终端会先打印初始化日志）", flush=True)
+    global _face_recognize_hint_logged
+    if not _face_recognize_hint_logged:
+        print(
+            "[face] POST /api/face/recognize 首次进入（若进程内尚未加载模型，下方会出现 FaceEmotionEngine 初始化日志）",
+            flush=True,
+        )
+        _face_recognize_hint_logged = True
     user_id, err_res = _require_auth()
     if err_res:
         return err_res
