@@ -2,9 +2,12 @@
 后端 API：为 frontend 提供 AI 对话、注册登录、文件上传等接口。
 """
 import base64
+import gc
 import json
 import os
 import secrets
+import threading
+import traceback
 import uuid
 import numpy as np
 import requests
@@ -31,7 +34,25 @@ from config import (
     DOUBAO_TTS_DEFAULT_VOICE,
 )
 import database as db
-from face_engine import get_engine
+
+# face_engine 含 PyTorch/OpenCV 等，启动时 import 会在小内存机上占满 CPU、数十秒才监听端口 → 延迟加载
+_face_engine_mod = None
+
+
+def _face_mod():
+    global _face_engine_mod
+    if _face_engine_mod is None:
+        import face_engine as _face_engine_mod
+
+    return _face_engine_mod
+
+
+# 人脸引擎异步预热（避免单次 HTTP 长时间阻塞导致 Vite 代理 / 浏览器 / axios 超时）
+_face_warmup_lock = threading.Lock()
+# 串行执行人脸推理，避免多请求叠加峰值内存导致 OOM Kill（threaded=True 时）
+_face_infer_lock = threading.Lock()
+_face_warmup_state = "idle"  # idle | starting | loading | ready | error
+_face_warmup_error = None  # str | None
 
 # 情绪异常判定阈值：最近 N 天内达到此次数则创建「主动疏导」触发
 PROACTIVE_ANOMALY_THRESHOLD = 3
@@ -43,6 +64,12 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 CORS(app, origins=["*"])
+
+
+def _err(message, status=400):
+    """统一 JSON 错误响应（须定义在文件前部，供人脸等路由在运行时安全调用）。"""
+    return jsonify({"error": message, "message": message}), status
+
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_too_large(e):
@@ -616,6 +643,75 @@ def _load_face_db_embeddings():
     return face_db
 
 
+# 注意：以下人脸相关函数在文件中靠前定义，但使用了后面定义的 _err()；
+# 仅在请求处理时调用，此时 _err 已绑定。
+
+
+def _get_face_engine_safe():
+    """初始化人脸引擎（含首次下载权重）；失败时返回 JSON 错误而非 500 栈。"""
+    try:
+        return _face_mod().get_engine(), None
+    except Exception as e:
+        return None, _err(str(e), 503)
+
+
+def _face_warmup_worker():
+    """后台线程中执行 get_engine()，避免阻塞 HTTP 连接。"""
+    global _face_warmup_state, _face_warmup_error
+    try:
+        with _face_warmup_lock:
+            _face_warmup_state = "loading"
+            _face_warmup_error = None
+        print(
+            "[face] 开始加载人脸引擎（MTCNN + FaceNet + 情绪）。内存不足时进程可能被系统 OOM Kill；"
+            "建议预留约 2GB+ 可用 RAM 或配置 swap。",
+            flush=True,
+        )
+        _face_mod().get_engine()
+        with _face_warmup_lock:
+            _face_warmup_state = "ready"
+    except Exception as e:
+        with _face_warmup_lock:
+            _face_warmup_state = "error"
+            _face_warmup_error = str(e)
+        traceback.print_exc()
+
+
+@app.route("/api/face/warmup", methods=["POST"])
+def face_warmup():
+    """可选：后台预取人脸引擎。业务上首次 /face/recognize 或带图的注册会惰性 get_engine()，不依赖本接口。"""
+    global _face_warmup_state, _face_warmup_error
+    try:
+        _user_id, err_res = _require_auth()
+        if err_res:
+            return err_res
+        with _face_warmup_lock:
+            if _face_warmup_state == "ready":
+                return jsonify({"ok": True, "message": "人脸引擎已就绪"}), 200
+            if _face_warmup_state in ("starting", "loading"):
+                return jsonify({"ok": False, "status": _face_warmup_state}), 202
+            _face_warmup_state = "starting"
+            _face_warmup_error = None
+            threading.Thread(target=_face_warmup_worker, name="face_warmup", daemon=True).start()
+            return jsonify({"ok": False, "status": "starting"}), 202
+    except Exception as e:
+        traceback.print_exc()
+        m = str(e).strip() or repr(e)
+        return jsonify({"error": m, "message": m}), 500
+
+
+@app.route("/api/face/warmup/status", methods=["GET"])
+def face_warmup_status():
+    """配合可选预热：查询进度（须登录）。"""
+    _user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    with _face_warmup_lock:
+        st = _face_warmup_state
+        err = _face_warmup_error
+    return jsonify({"ready": st == "ready", "status": st, "error": err})
+
+
 @app.route("/api/face/students", methods=["GET"])
 def list_face_students():
     user_id, err_res = _require_auth()
@@ -629,6 +725,7 @@ def list_face_students():
 
 @app.route("/api/face/students", methods=["POST"])
 def create_or_register_face_student():
+    print("[face] POST /api/face/students（注册/更新）已开始", flush=True)
     user_id, err_res = _require_auth()
     if err_res:
         return err_res
@@ -641,11 +738,20 @@ def create_or_register_face_student():
 
     face_feature_json = None
     if image_base64:
-        engine = get_engine()
-        frame = engine.decode_base64_image(image_base64)
-        if frame is None:
-            return _err("图片解析失败，请检查 image_base64 格式")
-        emb = engine.extract_embedding(frame)
+        with _face_infer_lock:
+            engine, err_eng = _get_face_engine_safe()
+            if err_eng:
+                return err_eng
+            frame = engine.decode_base64_image(image_base64)
+            if frame is None:
+                return _err("图片解析失败，请检查 image_base64 格式")
+            frame = _face_mod().limit_bgr_frame(frame)
+            try:
+                emb = engine.extract_embedding(frame)
+            except Exception as e:
+                gc.collect()
+                return _err(f"提取人脸特征失败: {e}", 500)
+            gc.collect()
         if emb is None:
             return _err("未检测到清晰正脸，暂无法注册人脸")
         face_feature_json = json.dumps(emb.tolist())
@@ -681,6 +787,7 @@ def delete_face_student(student_id):
 
 @app.route("/api/face/recognize", methods=["POST"])
 def face_recognize_once():
+    print("[face] POST /api/face/recognize 已开始（若首次加载模型，终端会先打印初始化日志）", flush=True)
     user_id, err_res = _require_auth()
     if err_res:
         return err_res
@@ -690,19 +797,26 @@ def face_recognize_once():
     if not image_base64:
         return _err("缺少 image_base64")
 
-    engine = get_engine()
-    frame = engine.decode_base64_image(image_base64)
-    if frame is None:
-        return _err("图片解析失败")
+    with _face_infer_lock:
+        engine, err_eng = _get_face_engine_safe()
+        if err_eng:
+            return err_eng
+        frame = engine.decode_base64_image(image_base64)
+        if frame is None:
+            return _err("图片解析失败")
+        frame = _face_mod().limit_bgr_frame(frame)
 
-    face_db = _load_face_db_embeddings()
-    detections = engine.detect(frame, face_db, threshold=threshold)
-    for d in detections:
-        if d.student_id != "unknown":
-            db.add_emotion_record(d.student_id, d.emotion, d.confidence)
+        face_db = _load_face_db_embeddings()
+        try:
+            detections = engine.detect(frame, face_db, threshold=threshold)
+        except Exception as e:
+            gc.collect()
+            return _err(f"识别失败: {e}", 500)
+        for d in detections:
+            if d.student_id != "unknown":
+                db.add_emotion_record(d.student_id, d.emotion, d.confidence)
 
-    return jsonify(
-        {
+        payload = {
             "width": int(frame.shape[1]),
             "height": int(frame.shape[0]),
             "count": len(detections),
@@ -716,7 +830,8 @@ def face_recognize_once():
                 for d in detections
             ],
         }
-    )
+        gc.collect()
+        return jsonify(payload)
 
 
 @app.route("/api/face/records", methods=["GET"])
@@ -1179,10 +1294,6 @@ def tts():
 # ---------- 认证：注册 / 登录 / 登出 / 当前用户 ----------
 
 
-def _err(message, status=400):
-    return jsonify({"error": message, "message": message}), status
-
-
 @app.route("/api/auth/register", methods=["POST"])
 def auth_register():
     """注册：body { username, email, password } -> { user, token }"""
@@ -1334,4 +1445,8 @@ def emotion_latest():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # use_reloader=False：首次拉取 FaceNet 权重约 107MB，若开启重载，改代码会重启进程导致下载中断。
+    # 需要热重载时可设置环境变量：FLASK_USE_RELOADER=1
+    _use_reloader = os.environ.get("FLASK_USE_RELOADER", "").lower() in ("1", "true", "yes")
+    # threaded=True：避免单次人脸推理阻塞其它请求；开发环境建议保留
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True, use_reloader=_use_reloader)

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import axios from 'axios'
 import {
   ApiError,
@@ -10,8 +10,10 @@ import {
 } from '@/utils/api'
 import { useToastStore } from '@/stores/useToastStore'
 
+/** EmotiEffLib 返回首字母大写英文类名，这里统一小写再映射 */
 const EMOTION_ZH: Record<string, string> = {
   anger: '愤怒',
+  contempt: '轻蔑',
   disgust: '厌恶',
   fear: '恐惧',
   happiness: '高兴',
@@ -21,8 +23,18 @@ const EMOTION_ZH: Record<string, string> = {
 }
 
 function getEmotionLabel(raw: string): string {
-  return EMOTION_ZH[raw] ?? raw
+  const key = String(raw).trim().toLowerCase()
+  return EMOTION_ZH[key] ?? raw
 }
+
+/** 两次识别请求之间的间隔：上一帧请求返回后再等这么久（2 核 / 小内存服务器请勿改太小） */
+const RECOGNIZE_INTERVAL_MS = 5000
+/** 摄像头尚未产出有效画面时的重试间隔 */
+const NO_FRAME_RETRY_MS = 400
+/** 上传前最长边上限，减轻后端解码与推理压力 */
+const UPLOAD_MAX_SIDE = 640
+/** JPEG 质量，略降可减小体积与内存峰值 */
+const UPLOAD_JPEG_QUALITY = 0.55
 
 export default function FaceMonitorPage() {
   const toast = useToastStore((s) => s.show)
@@ -31,12 +43,16 @@ export default function FaceMonitorPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const timerRef = useRef<number | null>(null)
   const runningRef = useRef(false)
+  const lastRecognizeErrorToastAt = useRef(0)
 
   const [students, setStudents] = useState<FaceStudent[]>([])
   const [detections, setDetections] = useState<FaceDetection[]>([])
   const [frameSize, setFrameSize] = useState({ width: 640, height: 480 })
   const [loading, setLoading] = useState(false)
   const [capturing, setCapturing] = useState(false)
+  const [registering, setRegistering] = useState(false)
+  const [recognizeError, setRecognizeError] = useState<string | null>(null)
+  const [showLongWaitHint, setShowLongWaitHint] = useState(false)
 
   const [name, setName] = useState('')
   const [studentId, setStudentId] = useState('')
@@ -46,18 +62,35 @@ export default function FaceMonitorPage() {
     [detections]
   )
 
-  const loadStudents = async () => {
+  const unknownFaceCount = useMemo(
+    () => detections.filter((d) => !d.student_id || d.student_id === 'unknown').length,
+    [detections]
+  )
+
+  const loadStudents = useCallback(async () => {
     try {
       const list = await listFaceStudents({ limit: 200 })
       setStudents(list)
-    } catch (e) {
+    } catch {
       toast('加载学生列表失败')
     }
-  }
+  }, [toast])
 
   useEffect(() => {
     loadStudents()
-  }, [])
+  }, [loadStudents])
+
+  /** 首次下载/加载模型常超过数十秒，避免用户误以为死机 */
+  useEffect(() => {
+    if (!loading && !registering) {
+      setShowLongWaitHint(false)
+      return
+    }
+    const t = window.setTimeout(() => setShowLongWaitHint(true), 45_000)
+    return () => {
+      window.clearTimeout(t)
+    }
+  }, [loading, registering])
 
   const stopLoop = () => {
     runningRef.current = false
@@ -73,7 +106,14 @@ export default function FaceMonitorPage() {
       streamRef.current.getTracks().forEach((t) => t.stop())
       streamRef.current = null
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
     setCapturing(false)
+    setDetections([])
+    setFrameSize({ width: 640, height: 480 })
+    setLoading(false)
+    setRecognizeError(null)
   }
 
   const startCamera = async () => {
@@ -100,16 +140,23 @@ export default function FaceMonitorPage() {
     const video = videoRef.current
     const canvas = canvasRef.current
     if (!video || !canvas) return null
-    const vw = video.videoWidth || 0
-    const vh = video.videoHeight || 0
+    let vw = video.videoWidth || 0
+    let vh = video.videoHeight || 0
     if (vw <= 0 || vh <= 0) return null
+
+    const m = Math.max(vw, vh)
+    if (m > UPLOAD_MAX_SIDE) {
+      const s = UPLOAD_MAX_SIDE / m
+      vw = Math.round(vw * s)
+      vh = Math.round(vh * s)
+    }
 
     canvas.width = vw
     canvas.height = vh
     const ctx = canvas.getContext('2d')
     if (!ctx) return null
     ctx.drawImage(video, 0, 0, vw, vh)
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
+    const dataUrl = canvas.toDataURL('image/jpeg', UPLOAD_JPEG_QUALITY)
     return dataUrl
   }
 
@@ -117,20 +164,35 @@ export default function FaceMonitorPage() {
     if (!runningRef.current) return
     const image_base64 = grabFrameBase64()
     if (!image_base64) {
-      timerRef.current = window.setTimeout(runRecognitionLoop, 350)
+      timerRef.current = window.setTimeout(runRecognitionLoop, NO_FRAME_RETRY_MS)
       return
     }
     setLoading(true)
     try {
       const res = await recognizeFaceImage({ image_base64 })
+      // 用户可能在请求返回前点了「停止」，避免旧结果再次画上检测框
+      if (!runningRef.current) return
       setDetections(res.detections ?? [])
       setFrameSize({ width: res.width || 640, height: res.height || 480 })
-    } catch {
-      // 识别过程失败时不打断摄像头循环，避免用户手动重启
+      setRecognizeError(null)
+    } catch (e) {
+      if (!runningRef.current) return
+      let msg = '识别接口异常'
+      if (e instanceof ApiError) msg = e.message || msg
+      else if (axios.isAxiosError(e)) {
+        const d = e.response?.data as { error?: string; message?: string } | undefined
+        msg = d?.error ?? d?.message ?? e.message ?? msg
+      }
+      setRecognizeError(msg)
+      const now = Date.now()
+      if (now - lastRecognizeErrorToastAt.current > 10_000) {
+        lastRecognizeErrorToastAt.current = now
+        toast(msg)
+      }
     } finally {
       setLoading(false)
       if (runningRef.current) {
-        timerRef.current = window.setTimeout(runRecognitionLoop, 700)
+        timerRef.current = window.setTimeout(runRecognitionLoop, RECOGNIZE_INTERVAL_MS)
       }
     }
   }
@@ -142,7 +204,16 @@ export default function FaceMonitorPage() {
       toast('请输入学号和姓名')
       return
     }
-    const image_base64 = grabFrameBase64() ?? undefined
+    if (!capturing) {
+      toast('请先点击「启动摄像头」并等待画面出现')
+      return
+    }
+    const image_base64 = grabFrameBase64()
+    if (!image_base64) {
+      toast('当前无法截取画面，请等待摄像头就绪后再试（画面需清晰、勿最小化窗口）')
+      return
+    }
+    setRegistering(true)
     try {
       await registerFaceStudent({ student_id: sid, name: nm, image_base64 })
       toast('注册成功，已写入后端人脸库')
@@ -159,6 +230,8 @@ export default function FaceMonitorPage() {
       } else {
         toast(fallback)
       }
+    } finally {
+      setRegistering(false)
     }
   }
 
@@ -169,11 +242,10 @@ export default function FaceMonitorPage() {
       <div className="mx-auto max-w-7xl p-4 md:p-6 space-y-4">
         <section className="rounded-2xl border border-gray-200/70 dark:border-gray-700 bg-white/80 dark:bg-gray-900/70 backdrop-blur p-4 md:p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
+            <div className="min-w-0 flex-1">
               <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100">人脸识别 + 七类情绪识别</h2>
-              <p className="text-sm text-gray-500 dark:text-gray-400">摄像头实时检测学号与情绪，结果会写入后端记录。</p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2 shrink-0">
               <button
                 type="button"
                 onClick={startCamera}
@@ -196,6 +268,12 @@ export default function FaceMonitorPage() {
 
         <section className="grid grid-cols-1 xl:grid-cols-3 gap-4">
           <div className="xl:col-span-2 rounded-2xl border border-gray-200 dark:border-gray-700 bg-black/90 overflow-hidden relative">
+            {recognizeError && (
+              <div className="absolute left-0 right-0 bottom-0 z-20 px-3 py-2 bg-red-900/90 text-red-100 text-xs sm:text-sm leading-snug border-t border-red-700">
+                <span className="font-medium">识别接口错误：</span>
+                {recognizeError}
+              </div>
+            )}
             <video ref={videoRef} className="w-full h-auto max-h-[72vh] object-contain" muted playsInline />
             <canvas ref={canvasRef} className="hidden" />
             {detections.map((d, idx) => {
@@ -215,7 +293,23 @@ export default function FaceMonitorPage() {
               )
             })}
             {loading && (
-              <div className="absolute right-3 top-3 px-2 py-1 rounded bg-black/50 text-white text-xs">识别中...</div>
+              <div className="absolute right-3 top-3 z-10 max-w-[min(100%,20rem)] text-right space-y-1">
+                <div className="inline-block px-2 py-1 rounded bg-black/50 text-white text-xs">识别中...</div>
+                {showLongWaitHint && (
+                  <div className="block text-[11px] leading-snug text-white/90 bg-black/55 rounded px-2 py-1.5 mt-1">
+                    若已等待较久：多为后端首次下载权重或 CPU 加载模型。请看运行 Flask 的终端是否出现
+                    <span className="font-mono"> [face]</span> 日志；也可先在 backend 执行{' '}
+                    <span className="font-mono text-[10px]">python check_face_setup.py --download-models</span>{' '}
+                    预下载后再试。
+                  </div>
+                )}
+              </div>
+            )}
+            {registering && showLongWaitHint && !loading && (
+              <div className="absolute left-3 bottom-12 z-10 max-w-[min(100%,22rem)] text-[11px] leading-snug text-white/95 bg-black/55 rounded px-2 py-1.5">
+                注册也需等人脸引擎就绪（与首次「识别」共用同一次模型加载）。请看后端终端{' '}
+                <span className="font-mono">[face]</span> 输出。
+              </div>
             )}
           </div>
 
@@ -238,9 +332,10 @@ export default function FaceMonitorPage() {
                 <button
                   type="button"
                   onClick={handleRegister}
-                  className="w-full px-3 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700"
+                  disabled={registering}
+                  className="w-full px-3 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  采集当前画面并注册
+                  {registering ? '注册中…' : '采集当前画面并注册'}
                 </button>
               </div>
             </div>
@@ -248,18 +343,29 @@ export default function FaceMonitorPage() {
             <div className="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 p-4">
               <h3 className="text-base font-semibold text-gray-900 dark:text-gray-100">当前识别</h3>
               <div className="mt-2 space-y-2 text-sm">
-                {activeDetections.length === 0 ? (
-                  <p className="text-gray-500 dark:text-gray-400">暂无已识别学生</p>
-                ) : (
-                  activeDetections.map((d, i) => (
-                    <div key={`${d.student_id}-${i}`} className="rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50/70 dark:bg-emerald-900/20 px-3 py-2">
-                      <p className="font-medium text-emerald-700 dark:text-emerald-300">{d.student_id}</p>
-                      <p className="text-emerald-600/90 dark:text-emerald-200/90">
-                        {getEmotionLabel(d.emotion)} / 置信度 {d.confidence.toFixed(2)}
-                      </p>
-                    </div>
-                  ))
+                {detections.length > 0 && activeDetections.length === 0 && (
+                  <p className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/80 dark:bg-amber-950/30 text-amber-900 dark:text-amber-100 px-3 py-2 text-xs leading-relaxed">
+                    画面中已检测到 {unknownFaceCount} 张人脸，但身份均为「未入库 / 未匹配」。请先在左侧「采集当前画面并注册」录入人脸库，或调整光线与角度。画面上方绿框仍会显示情绪与 unknown 学号。
+                  </p>
                 )}
+                {!capturing && (
+                  <p className="text-gray-500 dark:text-gray-400">请先启动摄像头</p>
+                )}
+                {capturing && detections.length === 0 && !loading && !recognizeError && (
+                  <p className="text-gray-500 dark:text-gray-400">
+                    {students.length === 0
+                      ? '未检测到人脸，或人脸库为空；正脸入镜后可先注册。'
+                      : '未检测到人脸，请正脸入镜；若已注册仍长期如此，请检查光线与摄像头。'}
+                  </p>
+                )}
+                {activeDetections.map((d, i) => (
+                  <div key={`${d.student_id}-${i}`} className="rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50/70 dark:bg-emerald-900/20 px-3 py-2">
+                    <p className="font-medium text-emerald-700 dark:text-emerald-300">{d.student_id}</p>
+                    <p className="text-emerald-600/90 dark:text-emerald-200/90">
+                      {getEmotionLabel(d.emotion)} / 置信度 {d.confidence.toFixed(2)}
+                    </p>
+                  </div>
+                ))}
               </div>
             </div>
 

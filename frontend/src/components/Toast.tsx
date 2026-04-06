@@ -8,7 +8,7 @@ export default function Toast() {
   return (
     <div
       role="status"
-      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] px-4 py-2.5 rounded-lg bg-gray-800 dark:bg-gray-700 text-white text-sm shadow-lg"
+      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[200] px-4 py-2.5 rounded-lg bg-gray-800 dark:bg-gray-700 text-white text-sm shadow-lg pointer-events-auto"
     >
       {message}
       <button

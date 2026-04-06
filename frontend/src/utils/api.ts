@@ -4,6 +4,8 @@ import { getCached, setCache, invalidateCache } from './apiCache'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
 const DEFAULT_TIMEOUT = 30000
+/** 人脸预热 POST/轮询：后端应秒回，但慢网络/Vite 代理下偶发超过 60s，避免误判超时 */
+const FACE_WARMUP_HTTP_TIMEOUT_MS = 300_000
 const MAX_RETRIES = 3
 const RETRY_DELAY_BASE = 1000
 
@@ -28,6 +30,9 @@ const client = axios.create({
 
 /** 是否为可重试的错误 */
 function isRetryableError(err: AxiosError): boolean {
+  // 请求超时不应重试，否则用户会长时间无反馈（例如人脸注册首次加载模型）
+  const msg = (err.message || '').toLowerCase()
+  if (err.code === 'ECONNABORTED' || msg.includes('timeout')) return false
   if (!err.response) return true // 网络错误
   const status = err.response.status
   if (status === 401 || status === 403) return false
@@ -81,10 +86,20 @@ function normalizeApiError(err: AxiosError): ApiError {
   const data = err.response?.data as { message?: string; error?: string; code?: string } | undefined
   const noResponse = !err.response
   const networkHint =
-    '无法连接后端：请在项目 backend 目录执行 python app.py，保持终端不关，并确认 http://127.0.0.1:5000/api/health 能访问'
+    '无法连接后端：请在 EmoDetect-DigitalMan/backend 目录执行 python app.py（或 python3 app.py），保持终端不关；Vite 会把 /api 代理到本机 :5000。若终端出现 Killed，多为内存不足（OOM），请增加 swap 或换更大内存机器。'
+  const msgLower = (err.message || '').toLowerCase()
+  const isConnRefused =
+    err.code === 'ECONNREFUSED' || msgLower.includes('econnrefused') || msgLower.includes('connect econnrefused')
   let message =
     data?.message ?? data?.error ?? err.message ?? `请求失败${status ? ` (${status})` : ''}`
-  if (noResponse && (err.code === 'ERR_NETWORK' || err.message === 'Network Error')) {
+  const isTimeout = err.code === 'ECONNABORTED' || msgLower.includes('timeout')
+  const reqPath = typeof err.config?.url === 'string' ? err.config.url : ''
+  const isFaceWarmupPath = reqPath.includes('face/warmup')
+  if (isTimeout) {
+    message = isFaceWarmupPath
+      ? '人脸预热接口请求超时：请确认 Flask 在 :5000 运行且未被阻塞；若机器或网络较慢，请稍后点击「重试加载模型」。'
+      : '请求超时：后端可能仍在处理（如人脸模型加载），请稍后重试或查看后端终端日志'
+  } else if (noResponse && (err.code === 'ERR_NETWORK' || err.message === 'Network Error' || isConnRefused)) {
     message = networkHint
   }
   return new ApiError(message, status, data?.code, data)
@@ -774,8 +789,50 @@ export interface FaceRecord {
   deleted_at: string | null
 }
 
+export interface FaceWarmupStatusResponse {
+  ready: boolean
+  status: string
+  error?: string | null
+}
+
+/** 可选：触发后端预取人脸引擎。页面已改为首次识别/注册惰性加载，一般无需调用。 */
+export async function postFaceWarmupStart(): Promise<'already' | 'queued'> {
+  const res = await client.post<{ ok?: boolean }>('/face/warmup', {}, { timeout: FACE_WARMUP_HTTP_TIMEOUT_MS })
+  if (res.status === 200 && res.data?.ok) return 'already'
+  return 'queued'
+}
+
+export async function getFaceWarmupStatus(): Promise<FaceWarmupStatusResponse> {
+  const res = await client.get<FaceWarmupStatusResponse>('/face/warmup/status', {
+    timeout: FACE_WARMUP_HTTP_TIMEOUT_MS,
+  })
+  const d = res.data
+  if (!d) throw new ApiError('无法获取人脸引擎状态', 500)
+  return d
+}
+
+/** 可选：轮询直到预取完成。一般无需使用（见 postFaceWarmupStart 说明）。 */
+export async function warmupFaceEngine(
+  onProgress?: (s: FaceWarmupStatusResponse) => void
+): Promise<{ ok: boolean; message?: string }> {
+  const q = await postFaceWarmupStart()
+  if (q === 'already') return { ok: true, message: '人脸引擎已就绪' }
+  const deadline = Date.now() + 120 * 60 * 1000
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1500))
+    const d = await getFaceWarmupStatus()
+    onProgress?.(d)
+    if (d.ready) return { ok: true, message: '人脸引擎已就绪' }
+    if (d.status === 'error' && d.error) throw new ApiError(d.error, 503)
+  }
+  throw new ApiError('等待人脸模型超时（超过 2 小时），请查看后端终端日志', 504)
+}
+
 export async function listFaceStudents(params?: { include_deleted?: boolean; limit?: number }): Promise<FaceStudent[]> {
-  const res = await client.get<FaceStudent[]>('/face/students', { params: params ?? {} })
+  const res = await client.get<FaceStudent[]>('/face/students', {
+    params: params ?? {},
+    timeout: 120_000,
+  })
   return res.data ?? []
 }
 
@@ -784,7 +841,8 @@ export async function registerFaceStudent(data: {
   name: string
   image_base64?: string
 }): Promise<FaceStudent> {
-  const res = await client.post<FaceStudent>('/face/students', data)
+  // CPU 首次下载权重 + 加载 MTCNN/FaceNet/情绪模型可能需数分钟
+  const res = await client.post<FaceStudent>('/face/students', data, { timeout: 600_000 })
   return res.data
 }
 
@@ -801,7 +859,7 @@ export async function recognizeFaceImage(data: {
   image_base64: string
   threshold?: number
 }): Promise<FaceRecognizeResponse> {
-  const res = await client.post<FaceRecognizeResponse>('/face/recognize', data, { timeout: 60000 })
+  const res = await client.post<FaceRecognizeResponse>('/face/recognize', data, { timeout: 600_000 })
   return res.data
 }
 
