@@ -4,9 +4,19 @@ import clsx from 'clsx'
 
 /** 允许的扩展名与 MIME 类型 */
 const ACCEPT_CONFIG = {
-  image: { extensions: ['jpg', 'jpeg', 'png', 'gif'], mimeTypes: ['image/jpeg', 'image/png', 'image/gif'] },
-  video: { extensions: ['mp4', 'mov'], mimeTypes: ['video/mp4', 'video/quicktime'] },
-  document: { extensions: ['pdf', 'doc', 'docx', 'txt'], mimeTypes: ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'] },
+  image: { extensions: ['jpg', 'jpeg', 'png', 'gif', 'webp'], mimeTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] },
+  video: { extensions: ['mp4', 'mov', 'webm'], mimeTypes: ['video/mp4', 'video/quicktime', 'video/webm'] },
+  document: {
+    extensions: ['pdf', 'doc', 'docx', 'ppt', 'pptx', 'txt'],
+    mimeTypes: [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'text/plain',
+    ],
+  },
 } as const
 
 const ALL_ACCEPT = [
@@ -103,7 +113,7 @@ export default function FileUpload({
       const valid = files.filter(isValidFileType)
       const invalidCount = files.length - valid.length
       if (invalidCount > 0) {
-        console.warn(`已忽略 ${invalidCount} 个不支持的文件类型。仅支持：图片(jpg,png,gif)、视频(mp4,mov)、文档(pdf,doc,txt)`)
+        console.warn(`已忽略 ${invalidCount} 个不支持的文件类型。仅支持：图片(jpg,png,gif,webp)、视频(mp4,mov,webm)、文档(pdf,doc,docx,ppt,pptx,txt)`)
       }
       const current = value ?? internalItems
       const remaining = maxFiles != null ? Math.max(0, maxFiles - current.length) : valid.length
@@ -225,7 +235,7 @@ export default function FileUpload({
           拖拽文件到此处，或点击选择
         </p>
         <p className="text-xs text-gray-500 dark:text-gray-500 mt-1 px-2">
-          支持图片(jpg/png/gif)、视频(mp4/mov)、文档(pdf/doc/txt)
+          支持图片(jpg/png/gif/webp)、视频(mp4/mov/webm)、文档(pdf/doc/docx/ppt/pptx/txt)
         </p>
         {maxFiles != null && (
           <p className="text-xs text-gray-500 dark:text-gray-500 mt-1">最多 {maxFiles} 个文件</p>

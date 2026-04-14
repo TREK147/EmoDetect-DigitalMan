@@ -4,6 +4,39 @@ import { getCached, setCache, invalidateCache } from './apiCache'
 
 const BASE_URL = import.meta.env.VITE_API_URL ?? '/api'
 const DEFAULT_TIMEOUT = 30000
+
+/**
+ * 将后端返回的路径（如 /api/uploads/...）转为浏览器可请求的 URL。
+ * 开发环境始终用相对路径走 Vite /api 代理，避免 VITE_API_URL 写成 127.0.0.1 时局域网访问失败。
+ */
+export function resolveApiAssetUrl(path: string): string {
+  const p = (path || '').trim()
+  if (!p) return p
+  if (
+    p.startsWith('http://') ||
+    p.startsWith('https://') ||
+    p.startsWith('blob:') ||
+    p.startsWith('data:')
+  ) {
+    return p
+  }
+  if (import.meta.env.DEV) {
+    return p.startsWith('/') ? p : `/${p}`
+  }
+  const base = import.meta.env.VITE_API_URL ?? '/api'
+  if (base.startsWith('http://') || base.startsWith('https://')) {
+    try {
+      const apiOrigin = new URL(base).origin
+      if (typeof window !== 'undefined' && window.location.origin !== apiOrigin) {
+        const absolutePath = p.startsWith('/') ? p : `/${p}`
+        return `${apiOrigin}${absolutePath}`
+      }
+    } catch {
+      return p.startsWith('/') ? p : `/${p}`
+    }
+  }
+  return p.startsWith('/') ? p : `/${p}`
+}
 /** 人脸预热 POST/轮询：后端应秒回，但慢网络/Vite 代理下偶发超过 60s，避免误判超时 */
 const FACE_WARMUP_HTTP_TIMEOUT_MS = 300_000
 const MAX_RETRIES = 3
@@ -127,7 +160,7 @@ export interface ConversationCreateRequest {
 
 export interface MessageSendRequest {
   content: string
-  type?: 'text' | 'image' | 'file' | 'voice'
+  type?: 'text' | 'image' | 'file' | 'voice' | 'video'
   fileUrl?: string
   fileName?: string
 }
@@ -402,7 +435,7 @@ export async function sendMessageStreamWithRetry(
   throw lastError
 }
 
-// ---------- 5. 实时语音（DashScope Realtime：语音入 -> 文本+语音出，与聊天框同步） ----------
+// ---------- 5. 实时语音（DashScope qwen3-omni-flash-realtime：语音入 -> 文本+语音出） ----------
 
 const REALTIME_PCM_SAMPLE_RATE = 16000
 
@@ -434,6 +467,53 @@ export async function decodeAudioBlobToPcm16Base64(blob: Blob): Promise<string> 
   return b64
 }
 
+/** 将录音 Blob 转为 wav 文件（16bit PCM 单声道），便于 Omni input_audio 兼容解析 */
+export async function convertAudioBlobToWavFile(
+  blob: Blob,
+  fileName = `voice-${Date.now()}.wav`
+): Promise<File> {
+  const arrayBuffer = await blob.arrayBuffer()
+  const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
+  try {
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0))
+    const sampleRate = audioBuffer.sampleRate
+    const src = audioBuffer.getChannelData(0)
+    const pcm = new Int16Array(src.length)
+    for (let i = 0; i < src.length; i++) {
+      const s = Math.max(-1, Math.min(1, src[i]!))
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
+    }
+    const wavBytes = 44 + pcm.byteLength
+    const out = new ArrayBuffer(wavBytes)
+    const view = new DataView(out)
+    let off = 0
+    const writeAscii = (text: string) => {
+      for (let i = 0; i < text.length; i++) view.setUint8(off++, text.charCodeAt(i))
+    }
+    // RIFF header
+    writeAscii('RIFF')
+    view.setUint32(off, wavBytes - 8, true); off += 4
+    writeAscii('WAVE')
+    // fmt chunk
+    writeAscii('fmt ')
+    view.setUint32(off, 16, true); off += 4 // PCM fmt chunk size
+    view.setUint16(off, 1, true); off += 2 // audio format = PCM
+    view.setUint16(off, 1, true); off += 2 // channels = mono
+    view.setUint32(off, sampleRate, true); off += 4
+    view.setUint32(off, sampleRate * 2, true); off += 4 // byte rate
+    view.setUint16(off, 2, true); off += 2 // block align
+    view.setUint16(off, 16, true); off += 2 // bits per sample
+    // data chunk
+    writeAscii('data')
+    view.setUint32(off, pcm.byteLength, true); off += 4
+    new Int16Array(out, off, pcm.length).set(pcm)
+    const wavBlob = new Blob([out], { type: 'audio/wav' })
+    return new File([wavBlob], fileName, { type: 'audio/wav' })
+  } finally {
+    await audioContext.close()
+  }
+}
+
 /**
  * 实时语音对话：发送 PCM base64，通过 SSE 接收文本片段与音频片段（与聊天框同步）。
  * 仅当「点击数字人」开启语音时，发送语音消息走此接口。
@@ -442,7 +522,8 @@ export async function chatRealtimeStream(
   conversationId: string,
   pcmBase64: string,
   onTextDelta: (delta: string) => void,
-  onAudioDelta: (base64: string) => void
+  onAudioDelta: (base64: string) => void,
+  onAssistantAudio?: (info: { audioUrl: string; fileName: string }) => void
 ): Promise<void> {
   const token = getStoredToken()
   const res = await fetch(`${BASE_URL}/chat/realtime`, {
@@ -475,10 +556,21 @@ export async function chatRealtimeStream(
       const raw = line.slice(6).trim()
       if (raw === '[DONE]') return
       try {
-        const data = JSON.parse(raw) as { content?: string; audio?: string; error?: string }
+        const data = JSON.parse(raw) as {
+          content?: string
+          audio?: string
+          error?: string
+          audioUrl?: string
+          fileName?: string
+        }
         if (data.error) throw new ApiError(data.error, 500)
         if (data.content) onTextDelta(data.content)
         if (data.audio) onAudioDelta(data.audio)
+        if (data.audioUrl)
+          onAssistantAudio?.({
+            audioUrl: data.audioUrl,
+            fileName: data.fileName ?? 'reply.wav',
+          })
       } catch (e) {
         if (e instanceof ApiError) throw e
       }
@@ -488,10 +580,21 @@ export async function chatRealtimeStream(
     const raw = buffer.slice(6).trim()
     if (raw !== '[DONE]') {
       try {
-        const data = JSON.parse(raw) as { content?: string; audio?: string; error?: string }
+        const data = JSON.parse(raw) as {
+          content?: string
+          audio?: string
+          error?: string
+          audioUrl?: string
+          fileName?: string
+        }
         if (data.error) throw new ApiError(data.error, 500)
         if (data.content) onTextDelta(data.content)
         if (data.audio) onAudioDelta(data.audio)
+        if (data.audioUrl)
+          onAssistantAudio?.({
+            audioUrl: data.audioUrl,
+            fileName: data.fileName ?? 'reply.wav',
+          })
       } catch (e) {
         if (e instanceof ApiError) throw e
       }
@@ -499,24 +602,22 @@ export async function chatRealtimeStream(
   }
 }
 
-// ---------- 6. 豆包 TTS（已由 Realtime 替代数字人语音，保留供可选） ----------
+export interface RealtimeSessionStartResponse {
+  sessionId: string
+}
 
-/**
- * 文本转语音，返回音频 Blob（例如 mp3）。
- * 前端拿到 Blob 后自行创建 Audio 播放，用于数字人播报。
- * @param text 要合成的文本
- * @param voiceType 可选，豆包控制台「音色详情」中的 Voice_type（如 zh_female_meilinvyou_moon_bigtts）
- */
-export async function textToSpeech(
-  text: string,
-  voiceType?: string
-): Promise<Blob> {
+export type RealtimeSessionEvent =
+  | { type: 'text_delta'; delta: string }
+  | { type: 'audio_delta'; audio: string }
+  | { type: 'response_done' }
+  | { type: 'error'; error: string }
+  | { type: 'session_closed'; reason?: string }
+
+/** 开启持续实时会话：后端建立到 qwen3-omni-flash-realtime 的 WS 会话。 */
+export async function startRealtimeSession(conversationId?: string): Promise<RealtimeSessionStartResponse> {
   const token = getStoredToken()
-  const body: { text: string; voice_type?: string } = {
-    text: text.slice(0, 2000),
-  }
-  if (voiceType) body.voice_type = voiceType
-  const res = await fetch(`${BASE_URL}/tts`, {
+  const body = conversationId ? { conversationId } : {}
+  const res = await fetch(`${BASE_URL}/chat/realtime/session/start`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -524,22 +625,96 @@ export async function textToSpeech(
     },
     body: JSON.stringify(body),
   })
-
   if (!res.ok) {
-    let message = `语音合成失败: ${res.status}`
-    try {
-      const err = (await res.json()) as { error?: string }
-      if (err?.error) message = err.error
-    } catch {
-      // ignore json parse error
-    }
-    throw new ApiError(message, res.status)
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `开启实时会话失败: ${res.status}`,
+      res.status
+    )
   }
-
-  return res.blob()
+  return res.json()
 }
 
-// ---------- 6. AI 对话（对接 backend /api/chat，转发 DashScope） ----------
+/** 向持续实时会话追加音频分片（16k/pcm16/base64）。 */
+export async function appendRealtimeSessionAudio(sessionId: string, audioBase64: string): Promise<void> {
+  const token = getStoredToken()
+  const res = await fetch(`${BASE_URL}/chat/realtime/session/${encodeURIComponent(sessionId)}/audio`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ audio: audioBase64 }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `发送实时音频失败: ${res.status}`,
+      res.status
+    )
+  }
+}
+
+/** 订阅实时会话事件流（SSE）：持续接收文本/语音增量。 */
+export async function subscribeRealtimeSessionEvents(
+  sessionId: string,
+  onEvent: (event: RealtimeSessionEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const token = getStoredToken()
+  const res = await fetch(`${BASE_URL}/chat/realtime/session/${encodeURIComponent(sessionId)}/events`, {
+    method: 'GET',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `订阅实时事件失败: ${res.status}`,
+      res.status
+    )
+  }
+  const reader = res.body?.getReader()
+  if (!reader) return
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (!raw) continue
+      try {
+        const event = JSON.parse(raw) as RealtimeSessionEvent
+        onEvent(event)
+      } catch {
+        // ignore malformed SSE row
+      }
+    }
+  }
+}
+
+/** 停止持续实时会话并释放后端连接资源。 */
+export async function stopRealtimeSession(sessionId: string): Promise<void> {
+  const token = getStoredToken()
+  const res = await fetch(`${BASE_URL}/chat/realtime/session/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new ApiError(
+      (err as { error?: string }).error ?? `关闭实时会话失败: ${res.status}`,
+      res.status
+    )
+  }
+}
+
+// ---------- 6. AI 对话（对接 backend /api/chat，DashScope qwen3-omni-flash） ----------
 
 export interface ChatHistoryItem {
   role: 'user' | 'assistant'
@@ -559,6 +734,8 @@ export interface UploadResult {
 }
 
 const UPLOAD_TIMEOUT_MS = 60000
+/** 流式对话（含语音多模态）可能较慢，避免无限等待 */
+const CHAT_STREAM_TIMEOUT_MS = 120_000
 
 export async function uploadFile(file: File): Promise<UploadResult> {
   const form = new FormData()
@@ -603,10 +780,21 @@ export async function chatWithAI(
 
 export interface ChatStreamOptions {
   imageUrl?: string
+  videoUrl?: string
+  /** 文档/文件 URL（如 /api/uploads/...），后端会解析文本后喂给模型 */
+  fileUrl?: string
+  /** 文档文件名，用于提示模型与日志落库展示 */
+  fileName?: string
   attachmentHint?: string
+  /** 用户语音上传后的地址（如 /api/uploads/...），服务端会读文件并以 input_audio 发给 qwen3-omni-flash */
+  audioUrl?: string
+  /** 与 audioUrl 对应的文件名，用于落库展示 */
+  voiceFileName?: string
+  /** 流式结束后 Omni 模型可能返回已保存的助手语音 URL（相对路径如 /api/uploads/...） */
+  onAssistantAudio?: (info: { audioUrl: string; fileName: string }) => void
 }
 
-/** 流式对话：需登录，会话历史由服务端从数据库读取并持久化。通过 onChunk 逐块接收 AI 回复。支持图片（imageUrl）和视频/语音描述（attachmentHint）。 */
+/** 流式对话：需登录，会话历史由服务端从数据库读取并持久化。通过 onChunk 逐块接收 AI 回复。支持图片（imageUrl）、视频（videoUrl）与语音（audioUrl）。 */
 export async function chatWithAIStream(
   conversationId: string,
   content: string,
@@ -620,57 +808,95 @@ export async function chatWithAIStream(
     content: content || undefined,
   }
   if (options?.imageUrl) body.imageUrl = options.imageUrl
+  if (options?.videoUrl) body.videoUrl = options.videoUrl
+  if (options?.fileUrl) body.fileUrl = options.fileUrl
+  if (options?.fileName) body.fileName = options.fileName
   if (options?.attachmentHint) body.attachmentHint = options.attachmentHint
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new ApiError(
-      (err as { error?: string }).error ?? `请求失败: ${res.status}`,
-      res.status
-    )
-  }
-  const reader = res.body?.getReader()
-  if (!reader) return
-  const decoder = new TextDecoder()
-  let buffer = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        const raw = line.slice(6).trim()
-        if (raw === '[DONE]') return
+  if (options?.audioUrl) body.audioUrl = options.audioUrl
+  if (options?.voiceFileName) body.voiceFileName = options.voiceFileName
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), CHAT_STREAM_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new ApiError(
+        (err as { error?: string }).error ?? `请求失败: ${res.status}`,
+        res.status
+      )
+    }
+    const reader = res.body?.getReader()
+    if (!reader) return
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const raw = line.slice(6).trim()
+          if (raw === '[DONE]') return
+          try {
+            const data = JSON.parse(raw) as {
+              content?: string
+              error?: string
+              audioUrl?: string
+              fileName?: string
+            }
+            if (data.error) throw new ApiError(data.error, 500)
+            if (data.content) onChunk(data.content)
+            if (data.audioUrl)
+              options?.onAssistantAudio?.({
+                audioUrl: data.audioUrl,
+                fileName: data.fileName ?? 'reply.wav',
+              })
+          } catch (e) {
+            if (e instanceof ApiError) throw e
+          }
+        }
+      }
+    }
+    if (buffer.startsWith('data: ')) {
+      const raw = buffer.slice(6).trim()
+      if (raw !== '[DONE]') {
         try {
-          const data = JSON.parse(raw) as { content?: string; error?: string }
+          const data = JSON.parse(raw) as {
+            content?: string
+            error?: string
+            audioUrl?: string
+            fileName?: string
+          }
           if (data.error) throw new ApiError(data.error, 500)
           if (data.content) onChunk(data.content)
+          if (data.audioUrl)
+            options?.onAssistantAudio?.({
+              audioUrl: data.audioUrl,
+              fileName: data.fileName ?? 'reply.wav',
+            })
         } catch (e) {
           if (e instanceof ApiError) throw e
         }
       }
     }
-  }
-  if (buffer.startsWith('data: ')) {
-    const raw = buffer.slice(6).trim()
-    if (raw !== '[DONE]') {
-      try {
-        const data = JSON.parse(raw) as { content?: string; error?: string }
-        if (data.error) throw new ApiError(data.error, 500)
-        if (data.content) onChunk(data.content)
-      } catch (e) {
-        if (e instanceof ApiError) throw e
-      }
+  } catch (e) {
+    if (e instanceof Error && e.name === 'AbortError') {
+      throw new ApiError('对话请求超时，请稍后重试或检查后端与网络')
     }
+    if (e instanceof ApiError) throw e
+    throw new ApiError(e instanceof Error ? e.message : '请求失败')
+  } finally {
+    clearTimeout(timeoutId)
   }
 }
 

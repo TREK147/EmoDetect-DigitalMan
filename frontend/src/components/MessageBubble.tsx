@@ -1,9 +1,11 @@
-import { useState } from 'react'
-import { Copy, Check, FileText, Image as ImageIcon } from 'lucide-react'
+import { useState, useRef, useEffect } from 'react'
+import { Copy, Check, FileText, Image as ImageIcon, Volume2 } from 'lucide-react'
 import { format } from 'date-fns'
 import { zhCN } from 'date-fns/locale'
 import clsx from 'clsx'
 import type { Message } from '@/types'
+import { resolveApiAssetUrl } from '@/utils/api'
+import { useToastStore } from '@/stores/useToastStore'
 
 interface MessageBubbleProps {
   message: Message
@@ -29,6 +31,28 @@ function getCopyContent(message: Message): string {
 export default function MessageBubble({ message, fileSize }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false)
   const isUser = message.sender === 'user'
+  const ttsRef = useRef<HTMLAudioElement | null>(null)
+  const toast = useToastStore((s) => s.show)
+
+  useEffect(() => {
+    return () => {
+      ttsRef.current?.pause()
+      ttsRef.current = null
+    }
+  }, [])
+
+  const handlePlayAssistantAudio = () => {
+    if (isUser || !message.fileUrl) return
+    const url = resolveApiAssetUrl(message.fileUrl)
+    if (!ttsRef.current) ttsRef.current = new Audio()
+    const el = ttsRef.current
+    el.pause()
+    el.src = url
+    el.load()
+    void el.play().catch(() => {
+      toast('无法播放语音，请确认后端已生成音频且可访问上传文件')
+    })
+  }
 
   const handleCopy = async () => {
     const text = getCopyContent(message)
@@ -109,34 +133,46 @@ export default function MessageBubble({ message, fileSize }: MessageBubbleProps)
               {message.fileName && (
                 <p className="text-xs opacity-80 truncate">{message.fileName}</p>
               )}
+              {message.content && (
+                <p className="whitespace-pre-wrap text-sm opacity-90 mt-1">
+                  {message.content}
+                </p>
+              )}
             </div>
           )}
 
           {message.type === 'file' && (
-            <a
-              href={message.fileUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className={clsx(
-                'flex items-center gap-3 p-3 rounded-lg border min-w-0',
-                isUser
-                  ? 'border-white/30 hover:bg-white/10'
-                  : 'border-gray-300 dark:border-gray-600 hover:bg-gray-200/50 dark:hover:bg-gray-600/50'
-              )}
-            >
-              <FileText className="w-8 h-8 shrink-0 opacity-80" />
-              <div className="min-w-0 flex-1">
-                <p className="font-medium truncate">
-                  {message.fileName || '未命名文件'}
-                </p>
-                {fileSize != null && (
-                  <p className="text-xs opacity-80 mt-0.5">
-                    {formatFileSize(fileSize)}
-                  </p>
+            <div className="space-y-2">
+              <a
+                href={message.fileUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={clsx(
+                  'flex items-center gap-3 p-3 rounded-lg border min-w-0',
+                  isUser
+                    ? 'border-white/30 hover:bg-white/10'
+                    : 'border-gray-300 dark:border-gray-600 hover:bg-gray-200/50 dark:hover:bg-gray-600/50'
                 )}
-                <p className="text-xs opacity-80 mt-0.5">点击下载</p>
-              </div>
-            </a>
+              >
+                <FileText className="w-8 h-8 shrink-0 opacity-80" />
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium truncate">
+                    {message.fileName || '未命名文件'}
+                  </p>
+                  {fileSize != null && (
+                    <p className="text-xs opacity-80 mt-0.5">
+                      {formatFileSize(fileSize)}
+                    </p>
+                  )}
+                  <p className="text-xs opacity-80 mt-0.5">点击下载</p>
+                </div>
+              </a>
+              {message.content && (
+                <p className="whitespace-pre-wrap text-sm opacity-90">
+                  {message.content}
+                </p>
+              )}
+            </div>
           )}
 
           {message.type === 'voice' && (
@@ -155,8 +191,10 @@ export default function MessageBubble({ message, fileSize }: MessageBubbleProps)
                   preload="metadata"
                 />
               )}
-              {message.content && !message.fileUrl && (
-                <span className="text-xs opacity-70">({message.content})</span>
+              {message.content && (
+                <p className="whitespace-pre-wrap text-sm opacity-90">
+                  {message.content}
+                </p>
               )}
             </div>
           )}
@@ -170,6 +208,17 @@ export default function MessageBubble({ message, fileSize }: MessageBubbleProps)
           )}
         >
           <span className="text-xs opacity-80">{timeStr}</span>
+          {!isUser && message.fileUrl && message.type === 'text' && (
+            <button
+              type="button"
+              onClick={handlePlayAssistantAudio}
+              className="p-1 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors touch-manipulation min-w-[28px] min-h-[28px] flex items-center justify-center"
+              title="播放语音"
+              aria-label="播放助手语音"
+            >
+              <Volume2 className="w-3.5 h-3.5 opacity-80" />
+            </button>
+          )}
           <button
             type="button"
             onClick={handleCopy}

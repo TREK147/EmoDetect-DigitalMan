@@ -18,9 +18,13 @@ interface PendingImage {
   fileName?: string
 }
 
-interface PendingVoice {
+interface PendingVideo {
   url: string
-  fileName: string
+  fileName?: string
+}
+
+interface PendingFile {
+  fileName?: string
 }
 
 interface InputAreaProps {
@@ -28,12 +32,21 @@ interface InputAreaProps {
   onChange: (value: string) => void
   onSubmit: () => void
   onFileSelect?: (files: File[]) => void
-  onVoiceRecordStart?: () => void
-  onVoiceRecordStop?: () => void
+  onVoiceRecordStart?: () => void | Promise<void>
+  onVoiceRecordStop?: () => void | Promise<void>
+  /**
+   * 与 useVoiceRecorder().isRecording 同步，避免「开始录音」异步失败时 UI 仍显示录制中、停止后无有效音频。
+   * 不传时回退为内部 state（仅兼容旧用法）。
+   */
+  voiceRecording?: boolean
   /** 待发送的图片（有图时无文字也可发送） */
   pendingImage?: PendingImage | null
-  /** 待发送的语音（有语音时无文字也可发送） */
-  pendingVoice?: PendingVoice | null
+  /** 待发送的视频（有视频时无文字也可发送） */
+  pendingVideo?: PendingVideo | null
+  /** 待发送的语音（有条时无文字也可发送） */
+  pendingVoice?: { url: string; fileName: string } | null
+  /** 待发送的文件（有文件时无文字也可发送） */
+  pendingFile?: PendingFile | null
   placeholder?: string
   disabled?: boolean
 }
@@ -45,16 +58,23 @@ export default function InputArea({
   onFileSelect,
   onVoiceRecordStart,
   onVoiceRecordStop,
+  voiceRecording,
   pendingImage = null,
+  pendingVideo = null,
   pendingVoice = null,
+  pendingFile = null,
   placeholder = '输入消息...',
   disabled = false,
 }: InputAreaProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [emojiOpen, setEmojiOpen] = useState(false)
-  const [isRecording, setIsRecording] = useState(false)
-  const canSubmit = value.trim() || pendingImage != null || pendingVoice != null
+  const [fallbackVoiceRecording, setFallbackVoiceRecording] = useState(false)
+  const isRecording =
+    voiceRecording !== undefined
+      ? voiceRecording
+      : fallbackVoiceRecording
+  const canSubmit = value.trim() || pendingImage != null || pendingVideo != null || pendingVoice != null || pendingFile != null
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -89,13 +109,18 @@ export default function InputArea({
     e.target.value = ''
   }
 
-  const handleVoiceClick = () => {
+  const handleVoiceClick = async () => {
     if (isRecording) {
-      onVoiceRecordStop?.()
-      setIsRecording(false)
+      if (voiceRecording === undefined) setFallbackVoiceRecording(false)
+      await onVoiceRecordStop?.()
     } else {
-      onVoiceRecordStart?.()
-      setIsRecording(true)
+      // 仅在旧用法（未传 voiceRecording）下使用 fallback 状态
+      if (voiceRecording === undefined) setFallbackVoiceRecording(true)
+      try {
+        await onVoiceRecordStart?.()
+      } catch {
+        if (voiceRecording === undefined) setFallbackVoiceRecording(false)
+      }
     }
   }
 
@@ -108,7 +133,7 @@ export default function InputArea({
             ref={fileInputRef}
             type="file"
             multiple
-            accept="image/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
+            accept="image/*,video/*,.pdf,.doc,.docx,.ppt,.pptx,.txt"
             onChange={handleFileChange}
             className="hidden"
           />

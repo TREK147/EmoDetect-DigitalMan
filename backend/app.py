@@ -3,8 +3,14 @@
 """
 import base64
 import gc
+import io
 import json
 import os
+import queue
+import re
+import tempfile
+import time
+import wave
 import secrets
 import threading
 import traceback
@@ -18,20 +24,39 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
+
+try:
+    from docx import Document as DocxDocument
+except Exception:
+    DocxDocument = None
+
+try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
+
+try:
+    import textract
+except Exception:
+    textract = None
+
 from config import (
     CHAT_API_URL,
     API_KEY,
     CHAT_MODEL,
+    CHAT_SYSTEM_PROMPT,
     MAX_TOKENS,
+    CHAT_OMNI_VOICE,
+    CHAT_OMNI_AUDIO_FORMAT,
+    CHAT_OMNI_SAMPLE_RATE,
     REALTIME_WS_URL,
     REALTIME_API_KEY,
     REALTIME_MODEL,
-    DOUBAO_TTS_APP_ID,
-    DOUBAO_TTS_ACCESS_TOKEN,
-    DOUBAO_TTS_CLUSTER,
-    DOUBAO_TTS_URL,
-    DOUBAO_TTS_RESOURCE_ID,
-    DOUBAO_TTS_DEFAULT_VOICE,
+    REALTIME_SYSTEM_PROMPT,
 )
 import database as db
 
@@ -85,7 +110,9 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 ALLOWED_IMAGE = {"jpg", "jpeg", "png", "gif", "webp"}
 ALLOWED_VIDEO = {"mp4", "mov", "webm"}
 ALLOWED_AUDIO = {"webm", "mp3", "wav", "ogg", "m4a"}
-ALLOWED_EXT = ALLOWED_IMAGE | ALLOWED_VIDEO | ALLOWED_AUDIO | {"pdf", "doc", "docx", "txt"}
+ALLOWED_DOCUMENT = {"txt", "doc", "docx", "ppt", "pptx", "pdf"}
+ALLOWED_EXT = ALLOWED_IMAGE | ALLOWED_VIDEO | ALLOWED_AUDIO | ALLOWED_DOCUMENT
+DOC_EXTRACT_MAX_CHARS = 12000
 
 # 启动时尝试创建 users 表（若 DB 不可用，注册时再报错）
 try:
@@ -120,10 +147,21 @@ def _require_auth():
     return user_id, None
 
 
-def build_messages(history: list, content: str, image_base64: str = None, image_mime: str = None) -> list:
+def build_messages(
+    history: list,
+    content: str,
+    image_base64: str = None,
+    image_mime: str = None,
+    video_base64: str = None,
+    video_mime: str = None,
+    audio_base64: str = None,
+    audio_mime: str = None,
+    document_text: str = None,
+    document_name: str = None,
+) -> list:
     """
     将历史 + 当前用户消息转为 OpenAPI messages 格式。
-    若 image_base64 存在，最后一条为多模态 content 数组（文本 + 图片）。
+    若 image_base64 / video_base64 / audio_base64 存在，最后一条为多模态 content 数组。
     """
     messages = []
     for item in history or []:
@@ -133,19 +171,108 @@ def build_messages(history: list, content: str, image_base64: str = None, image_
         messages.append({"role": role, "content": (item.get("content") or "").strip()})
 
     text = (content or "").strip()
-    if image_base64:
-        mime = image_mime or "image/jpeg"
-        data_url = f"data:{mime};base64,{image_base64}"
+    if document_text:
+        doc_title = (document_name or "文档").strip()[:120]
+        doc_part = (
+            f"【用户上传文档：{doc_title}】\n"
+            "以下是从文档中提取的文本（可能有少量格式丢失），请据此理解并回答：\n"
+            f"{document_text.strip()}"
+        )
+        text = f"{text}\n\n{doc_part}".strip() if text else doc_part
+    if image_base64 or video_base64 or audio_base64:
+        image_mime = image_mime or "image/jpeg"
+        video_mime = video_mime or "video/mp4"
         parts = []
         if text:
             parts.append({"type": "text", "text": text})
-        parts.append({"type": "image_url", "image_url": {"url": data_url}})
+        if image_base64:
+            data_url = f"data:{image_mime};base64,{image_base64}"
+            parts.append({"type": "image_url", "image_url": {"url": data_url}})
+        if video_base64:
+            data_url = f"data:{video_mime};base64,{video_base64}"
+            parts.append({"type": "video_url", "video_url": {"url": data_url}})
+        if audio_base64:
+            fmt = (audio_mime or "").split("/")[-1].lower() if audio_mime else "wav"
+            if fmt in ("x-wav", "wave"):
+                fmt = "wav"
+            audio_data = (audio_base64 or "").strip()
+            # DashScope 兼容模式要求 input_audio.data 为可解析 URL 或 data:;base64,...；
+            # 直接传裸 base64 会被当作 URL 校验并报 InvalidParameter。
+            if audio_data and not audio_data.startswith("data:"):
+                audio_data = f"data:;base64,{audio_data}"
+            parts.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": audio_data,
+                        "format": fmt or "wav",
+                    },
+                }
+            )
+        if not parts:
+            parts.append({"type": "text", "text": "（无文字内容）"})
         messages.append({"role": "user", "content": parts})
     else:
         if not text:
             text = "（无文字内容）"
         messages.append({"role": "user", "content": text})
     return messages
+
+
+def _with_chat_system_prompt(messages: list) -> list:
+    """为 qwen3-omni-flash 等对话模型注入小 Q 人设（置于 messages 最前）。"""
+    text = (CHAT_SYSTEM_PROMPT or "").strip()
+    if not text:
+        return messages or []
+    return [{"role": "system", "content": text}] + (messages or [])
+
+
+def _chat_model_supports_omni_audio() -> bool:
+    """HTTP Chat 是否请求文本+语音输出（与 Realtime WebSocket 无关）。"""
+    m = (CHAT_MODEL or "").lower()
+    return "omni" in m and "realtime" not in m
+
+
+def _save_assistant_audio_file(wav_bytes: bytes, conv_id: int) -> tuple[str, str]:
+    """将助手回复音频写入 uploads，返回 (对外 URL 路径, 文件名)。"""
+    sub = uuid.uuid4().hex[:8]
+    save_dir = os.path.join(UPLOAD_DIR, sub)
+    os.makedirs(save_dir, exist_ok=True)
+    ext = (CHAT_OMNI_AUDIO_FORMAT or "wav").lstrip(".").lower() or "wav"
+    name = f"ai-reply-{conv_id}-{uuid.uuid4().hex[:10]}.{ext}"
+    path = os.path.join(save_dir, name)
+    with open(path, "wb") as f:
+        f.write(wav_bytes)
+    rel = f"{sub}/{name}"
+    return f"/api/uploads/{rel}", name
+
+
+def _pcm16le_mono_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+    """将 16bit 小端单声道 PCM 裸数据封装为标准 RIFF WAV（浏览器可播）。"""
+    if len(pcm) < 2:
+        return b""
+    if len(pcm) % 2 == 1:
+        pcm = pcm[:-1]
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _decoded_omni_audio_to_wav_bytes(raw: bytes) -> bytes:
+    """
+    DashScope Omni 流式 audio 解码后多为裸 PCM；若已是 RIFF WAVE 则原样返回。
+    若配置为 mp3 等容器格式则不做 PCM 封装。
+    """
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        return raw
+    ext = (CHAT_OMNI_AUDIO_FORMAT or "wav").lstrip(".").lower()
+    if ext in ("mp3", "mpeg", "opus", "aac"):
+        return raw
+    return _pcm16le_mono_to_wav(raw, CHAT_OMNI_SAMPLE_RATE)
 
 
 def _resolve_image_from_request(data: dict):
@@ -169,6 +296,259 @@ def _resolve_image_from_request(data: dict):
         except Exception:
             pass
     return None, None
+
+
+def _resolve_audio_from_request(data: dict):
+    """
+    从请求中解析 audio_base64、audio_mime、file_name。
+    支持 audioBase64 或 audioUrl（本地上传路径 /api/uploads/...）。
+    """
+    b64 = data.get("audioBase64") or data.get("audio_base64")
+    if b64:
+        mime = (data.get("audioMime") or data.get("audio_mime") or "audio/wav").strip()
+        name = (data.get("voiceFileName") or data.get("voice_file_name") or "").strip() or None
+        return b64, mime, name
+
+    url = data.get("audioUrl") or data.get("audio_url")
+    if url and isinstance(url, str) and "/api/uploads/" in url:
+        try:
+            rel = url.split("/api/uploads/", 1)[-1].lstrip("/")
+            if ".." in rel or not rel:
+                return None, None, None
+            path = os.path.join(UPLOAD_DIR, rel)
+            if not os.path.isfile(path):
+                return None, None, None
+            ext = os.path.splitext(path)[1].lower().lstrip(".")
+            if ext not in ALLOWED_AUDIO:
+                return None, None, None
+            with open(path, "rb") as f:
+                raw = f.read()
+            if not raw:
+                return None, None, None
+            mime = {
+                "webm": "audio/webm",
+                "mp3": "audio/mpeg",
+                "wav": "audio/wav",
+                "ogg": "audio/ogg",
+                "m4a": "audio/m4a",
+            }.get(ext, "audio/wav")
+            file_name = os.path.basename(path) or None
+            return base64.b64encode(raw).decode("ascii"), mime, file_name
+        except Exception:
+            return None, None, None
+    return None, None, None
+
+
+def _resolve_video_from_request(data: dict):
+    """
+    从请求中解析 video_base64 与 video_mime。
+    支持 videoBase64 或 videoUrl（本地上传路径 /api/uploads/...）。
+    """
+    b64 = data.get("videoBase64") or data.get("video_base64")
+    if b64:
+        mime = (data.get("videoMime") or data.get("video_mime") or "video/mp4").strip()
+        return b64, mime
+
+    url = data.get("videoUrl") or data.get("video_url")
+    if url and isinstance(url, str) and "/api/uploads/" in url:
+        try:
+            rel = url.split("/api/uploads/", 1)[-1].lstrip("/")
+            if ".." in rel or not rel:
+                return None, None
+            path = os.path.join(UPLOAD_DIR, rel)
+            if not os.path.isfile(path):
+                return None, None
+            ext = os.path.splitext(path)[1].lower().lstrip(".")
+            if ext not in ALLOWED_VIDEO:
+                return None, None
+            with open(path, "rb") as f:
+                raw = f.read()
+            if not raw:
+                return None, None
+            mime = {
+                "mp4": "video/mp4",
+                "mov": "video/quicktime",
+                "webm": "video/webm",
+            }.get(ext, "video/mp4")
+            return base64.b64encode(raw).decode("ascii"), mime
+        except Exception:
+            return None, None
+    return None, None
+
+
+def _mime_from_ext(ext: str) -> str:
+    mapping = {
+        "txt": "text/plain",
+        "pdf": "application/pdf",
+        "doc": "application/msword",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ppt": "application/vnd.ms-powerpoint",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
+    return mapping.get((ext or "").lower().strip("."), "application/octet-stream")
+
+
+def _extract_readable_strings(raw: bytes, min_len: int = 6) -> str:
+    if not raw:
+        return ""
+    chunks = []
+    seen = set()
+    for enc in ("utf-16le", "utf-8", "latin1"):
+        try:
+            text = raw.decode(enc, errors="ignore")
+        except Exception:
+            continue
+        for m in re.finditer(r"[\u4e00-\u9fffA-Za-z0-9，。！？；：、,.!?;:()\[\]{}《》“”\"'‘’%+\-_/\\]{%d,}" % min_len, text):
+            seg = re.sub(r"\s+", " ", (m.group(0) or "").strip())
+            if len(seg) < min_len:
+                continue
+            key = seg.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            chunks.append(seg)
+            if len(chunks) >= 300:
+                break
+        if len(chunks) >= 300:
+            break
+    return "\n".join(chunks)
+
+
+def _extract_text_from_txt(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "utf-16", "utf-16le", "utf-16be"):
+        try:
+            return raw.decode(enc).strip()
+        except Exception:
+            continue
+    return raw.decode("latin1", errors="ignore").strip()
+
+
+def _extract_text_from_pdf(raw: bytes) -> str:
+    if not PdfReader:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        parts = []
+        for idx, page in enumerate(reader.pages):
+            txt = (page.extract_text() or "").strip()
+            if txt:
+                parts.append(f"[第{idx + 1}页]\n{txt}")
+            if sum(len(x) for x in parts) >= DOC_EXTRACT_MAX_CHARS:
+                break
+        return "\n\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_from_docx(raw: bytes) -> str:
+    if not DocxDocument:
+        return ""
+    try:
+        doc = DocxDocument(io.BytesIO(raw))
+        parts = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                parts.append(t)
+            if sum(len(x) for x in parts) >= DOC_EXTRACT_MAX_CHARS:
+                break
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_from_pptx(raw: bytes) -> str:
+    if not Presentation:
+        return ""
+    try:
+        prs = Presentation(io.BytesIO(raw))
+        parts = []
+        for sidx, slide in enumerate(prs.slides):
+            slide_lines = []
+            for shape in slide.shapes:
+                text = getattr(shape, "text", None)
+                if not text:
+                    continue
+                line = str(text).strip()
+                if line:
+                    slide_lines.append(line)
+            if slide_lines:
+                parts.append(f"[第{sidx + 1}页]\n" + "\n".join(slide_lines))
+            if sum(len(x) for x in parts) >= DOC_EXTRACT_MAX_CHARS:
+                break
+        return "\n\n".join(parts).strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_via_textract(raw: bytes, ext: str) -> str:
+    if not textract:
+        return ""
+    suffix = f".{(ext or '').lower().strip('.')}"
+    try:
+        with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
+            tmp.write(raw)
+            tmp.flush()
+            out = textract.process(tmp.name)
+            return (out or b"").decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_from_document(raw: bytes, ext: str) -> str:
+    ext = (ext or "").lower().strip(".")
+    text = ""
+    if ext == "txt":
+        text = _extract_text_from_txt(raw)
+    elif ext == "pdf":
+        text = _extract_text_from_pdf(raw)
+    elif ext == "docx":
+        text = _extract_text_from_docx(raw)
+    elif ext == "pptx":
+        text = _extract_text_from_pptx(raw)
+    elif ext in ("doc", "ppt"):
+        text = _extract_text_via_textract(raw, ext) or _extract_readable_strings(raw)
+    if not text:
+        text = _extract_readable_strings(raw)
+    text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+    if len(text) > DOC_EXTRACT_MAX_CHARS:
+        text = text[:DOC_EXTRACT_MAX_CHARS] + "\n...(文档较长，已截断)"
+    return text
+
+
+def _resolve_document_from_request(data: dict):
+    """
+    从请求中解析文档文本内容。
+    支持 documentUrl / fileUrl（本地上传路径 /api/uploads/...）。
+    """
+    url = (
+        data.get("documentUrl")
+        or data.get("document_url")
+        or data.get("fileUrl")
+        or data.get("file_url")
+    )
+    if not (url and isinstance(url, str) and "/api/uploads/" in url):
+        return None, None, None
+    try:
+        rel = url.split("/api/uploads/", 1)[-1].lstrip("/")
+        if ".." in rel or not rel:
+            return None, None, None
+        path = os.path.join(UPLOAD_DIR, rel)
+        if not os.path.isfile(path):
+            return None, None, None
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if ext not in ALLOWED_DOCUMENT:
+            return None, None, None
+        with open(path, "rb") as f:
+            raw = f.read()
+        if not raw:
+            return None, None, None
+        text = _extract_text_from_document(raw, ext)
+        if not text:
+            return None, None, os.path.basename(path) or None
+        return text, _mime_from_ext(ext), os.path.basename(path) or None
+    except Exception:
+        return None, None, None
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -319,22 +699,33 @@ def _detect_emotion_anomaly(user_id: int, user_text: str) -> None:
 @app.route("/api/chat", methods=["POST"])
 def chat():
     """
-    请求体: { "content": "用户输入", "messages": [...], 可选 "imageBase64"/"imageUrl", "attachmentHint" }
+    请求体: { "content": "用户输入", "messages": [...], 可选 "imageBase64"/"imageUrl", "videoBase64"/"videoUrl", "attachmentHint" }
     响应:   { "content": "AI 回复文本" }
     """
     try:
         data = request.get_json(force=True, silent=True) or {}
         content = (data.get("content") or "").strip()
         attachment_hint = (data.get("attachmentHint") or data.get("attachment_hint") or "").strip()
-        if not content and not attachment_hint:
-            image_b64, _ = _resolve_image_from_request(data)
-            if not image_b64:
-                return jsonify({"error": "content 或附件不能为空"}), 400
+        image_b64, image_mime = _resolve_image_from_request(data)
+        video_b64, video_mime = _resolve_video_from_request(data)
+        doc_text, _doc_mime, doc_name = _resolve_document_from_request(data)
+        if not content and not attachment_hint and not image_b64 and not video_b64 and not doc_text:
+            return jsonify({"error": "content 或附件不能为空"}), 400
         if attachment_hint and not content:
             content = attachment_hint
-        image_b64, image_mime = _resolve_image_from_request(data)
         history = data.get("messages") or []
-        messages = build_messages(history, content, image_b64, image_mime)
+        messages = _with_chat_system_prompt(
+            build_messages(
+                history,
+                content,
+                image_b64,
+                image_mime,
+                video_b64,
+                video_mime,
+                document_text=doc_text,
+                document_name=doc_name,
+            )
+        )
 
         payload = {
             "model": CHAT_MODEL,
@@ -487,7 +878,7 @@ def list_messages(conv_id):
 @app.route("/api/chat/stream", methods=["POST"])
 def chat_stream():
     """
-    流式对话：需登录。请求体需含 conversationId；支持 content、imageUrl、attachmentHint。
+    流式对话：需登录。请求体需含 conversationId；支持 content、imageUrl、videoUrl、attachmentHint、audioUrl。
     会将会话与消息写入数据库，历史从数据库读取。
     响应为 SSE：data: {"content": "增量文本"}，结束 data: [DONE] 或 data: {"type":"done"}。
     """
@@ -510,7 +901,10 @@ def chat_stream():
         content = (data.get("content") or "").strip()
         attachment_hint = (data.get("attachmentHint") or data.get("attachment_hint") or "").strip()
         image_b64, image_mime = _resolve_image_from_request(data)
-        if not content and not attachment_hint and not image_b64:
+        video_b64, video_mime = _resolve_video_from_request(data)
+        audio_b64, audio_mime, voice_file_name = _resolve_audio_from_request(data)
+        doc_text, _doc_mime, doc_name = _resolve_document_from_request(data)
+        if not content and not attachment_hint and not image_b64 and not video_b64 and not audio_b64 and not doc_text:
             return jsonify({"error": "content 或附件不能为空"}), 400
         if attachment_hint and not content:
             content = attachment_hint
@@ -522,11 +916,41 @@ def chat_stream():
             role = (r.get("role") or "user").strip()
             if role in ("user", "assistant"):
                 history.append({"role": role, "content": (r.get("content") or "").strip()})
-        messages_for_ai = build_messages(history, content, image_b64, image_mime)
+        messages_for_ai = _with_chat_system_prompt(
+            build_messages(
+                history,
+                content,
+                image_b64,
+                image_mime,
+                video_b64,
+                video_mime,
+                audio_b64,
+                audio_mime,
+                document_text=doc_text,
+                document_name=doc_name,
+            )
+        )
 
         # 写入用户消息
-        user_content = content or (attachment_hint or "[图片/附件]")
-        user_msg_id = db.create_message(conv_id, "user", user_content, "text", None, None)
+        user_content = content or (
+            attachment_hint
+            or ("用户发来一条语音：" if audio_b64 else (f"用户上传文档：{doc_name}" if doc_text else "[图片/附件]"))
+        )
+        user_msg_type = "voice" if audio_b64 else "text"
+        user_file_url = (data.get("audioUrl") or data.get("audio_url")) if audio_b64 else None
+        user_file_name = (
+            (voice_file_name or (data.get("voiceFileName") or data.get("voice_file_name")))
+            if audio_b64
+            else None
+        )
+        db.create_message(
+            conv_id,
+            "user",
+            user_content,
+            user_msg_type,
+            user_file_url,
+            user_file_name,
+        )
         db.update_conversation_last_message(conv_id, user_content)
 
         payload = {
@@ -535,6 +959,13 @@ def chat_stream():
             "max_tokens": MAX_TOKENS,
             "stream": True,
         }
+        # 用户上传语音（input_audio）时仅要文字回复，不请求助手侧 TTS，避免与「语音输入」组合时兼容或流式异常
+        if _chat_model_supports_omni_audio() and not audio_b64:
+            payload["modalities"] = ["text", "audio"]
+            payload["audio"] = {
+                "voice": (CHAT_OMNI_VOICE or "Cherry").strip(),
+                "format": (CHAT_OMNI_AUDIO_FORMAT or "wav").strip().lstrip("."),
+            }
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {API_KEY}",
@@ -542,9 +973,10 @@ def chat_stream():
 
         def generate():
             full_content = []
+            audio_b64_parts = []
             try:
                 resp = requests.post(
-                    CHAT_API_URL, json=payload, headers=headers, timeout=60, stream=True
+                    CHAT_API_URL, json=payload, headers=headers, timeout=120, stream=True
                 )
                 resp.raise_for_status()
                 for line in resp.iter_lines(decode_unicode=True):
@@ -555,20 +987,48 @@ def chat_stream():
                         break
                     try:
                         obj = json.loads(raw)
-                        delta = (
-                            obj.get("choices", [{}])[0]
-                            .get("delta", {})
-                            .get("content", "")
-                        )
-                        if delta:
-                            full_content.append(delta)
-                            yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
+                        choices = obj.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        if not isinstance(delta, dict):
+                            continue
+                        text_delta = delta.get("content") or ""
+                        if text_delta:
+                            full_content.append(text_delta)
+                            yield f"data: {json.dumps({'content': text_delta}, ensure_ascii=False)}\n\n"
+                        audio_obj = delta.get("audio")
+                        if isinstance(audio_obj, dict):
+                            piece = audio_obj.get("data")
+                            if isinstance(piece, str) and piece:
+                                audio_b64_parts.append(piece)
                     except (json.JSONDecodeError, IndexError, KeyError, TypeError):
                         pass
                 # 流结束后写入 assistant 消息并更新会话摘要；从用户输入中抽取日程并写入
                 ai_content = "".join(full_content).strip() or "（无回复）"
-                db.create_message(conv_id, "assistant", ai_content, "text", None, None)
+                audio_url = None
+                audio_name = None
+                merged_b64 = "".join(audio_b64_parts).strip()
+                if merged_b64:
+                    try:
+                        raw_audio = base64.b64decode(merged_b64, validate=False)
+                        if raw_audio:
+                            wav_bytes = _decoded_omni_audio_to_wav_bytes(raw_audio)
+                            if wav_bytes:
+                                audio_url, audio_name = _save_assistant_audio_file(wav_bytes, conv_id)
+                    except Exception:
+                        pass
+                db.create_message(
+                    conv_id,
+                    "assistant",
+                    ai_content,
+                    "text",
+                    audio_url,
+                    audio_name,
+                )
                 db.update_conversation_last_message(conv_id, ai_content)
+                if audio_url and audio_name:
+                    yield f"data: {json.dumps({'audioUrl': audio_url, 'fileName': audio_name}, ensure_ascii=False)}\n\n"
                 _detect_emotion_anomaly(int(user_id), user_content)
                 _extract_schedules_from_text(int(user_id), user_content)
                 yield "data: [DONE]\n\n"
@@ -1073,230 +1533,266 @@ def schedule_delete(schedule_id):
 # ---------- 实时对话（DashScope Realtime：语音入 -> 文本+语音出，与聊天框同步） ----------
 
 _REALTIME_CHUNK_BYTES = 3200  # 100ms @ 16k 16bit mono
+_REALTIME_CONNECT_TIMEOUT_SEC = 30
+_REALTIME_RECV_TIMEOUT_SEC = 180
+_REALTIME_EVENT_IDLE_TIMEOUT_SEC = 20
+_REALTIME_SESSIONS = {}
+_REALTIME_SESSIONS_LOCK = threading.Lock()
 
 
-def _realtime_stream(conv_id, user_id, pcm_base64):
-    """连接 DashScope Realtime，发送 PCM 音频，流式返回文本与音频。"""
-    url = f"{REALTIME_WS_URL.rstrip('/')}?model={REALTIME_MODEL}"
-    headers = [f"Authorization: Bearer {REALTIME_API_KEY}"]
-    full_transcript = []
-    try:
-        ws = websocket.create_connection(url, header=headers, timeout=30)
-    except Exception as e:
-        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+def _build_realtime_instructions() -> str:
+    """实时语音助手系统提示词（与非实时会话完全解耦）。"""
+    base = (REALTIME_SYSTEM_PROMPT or "").strip() or "你是同学们的好朋友小Q，请简洁友好地回复。"
+    return base
+
+
+def _realtime_emit(session, payload):
+    q = session.get("queue")
+    if q is None:
         return
     try:
-        # session.update：modalities 顺序需为 ['audio','text']（文档要求），仅输出文本+音频，不启用 VAD
-        session_event = {
-            "type": "session.update",
-            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
-            "session": {
-                "modalities": ["audio", "text"],
-                "voice": "Cherry",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm24",
-                "input_audio_transcription": {"model": "gummy-realtime-v1"},
-                "turn_detection": None,
-                "instructions": "你是智慧星数字人助手，请简洁友好地回复。",
-            },
-        }
-        ws.send(json.dumps(session_event, ensure_ascii=False))
-        # 等待 session.updated 后再发音频（可能先收到 session.created）
-        while True:
-            first = ws.recv()
-            if not first:
-                break
-            try:
-                ev = json.loads(first)
-                typ = ev.get("type") or ""
-                if typ == "error":
-                    err = ev.get("error") or {}
-                    msg = err.get("message") or ev.get("message") or str(ev.get("code", "unknown"))
-                    yield f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n"
-                    return
-                if typ == "session.updated":
-                    break
-            except json.JSONDecodeError:
-                break
+        q.put(payload, block=False)
+    except queue.Full:
+        pass
 
-        # 发送 PCM：按 3200 字节一块 append
-        pcm_bytes = base64.b64decode(pcm_base64)
-        for i in range(0, len(pcm_bytes), _REALTIME_CHUNK_BYTES):
-            chunk = pcm_bytes[i : i + _REALTIME_CHUNK_BYTES]
-            b64_chunk = base64.b64encode(chunk).decode("ascii")
-            ws.send(json.dumps({
-                "type": "input_audio_buffer.append",
-                "event_id": f"evt_{uuid.uuid4().hex[:24]}",
-                "audio": b64_chunk,
-            }, ensure_ascii=False))
 
-        ws.send(json.dumps({
-            "type": "input_audio_buffer.commit",
-            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
-        }, ensure_ascii=False))
+def _close_realtime_session(session_id, reason="closed"):
+    with _REALTIME_SESSIONS_LOCK:
+        session = _REALTIME_SESSIONS.pop(session_id, None)
+    if not session:
+        return
+    session["active"] = False
+    try:
+        ws = session.get("ws")
+        if ws is not None:
+            ws.close()
+    except Exception:
+        pass
+    _realtime_emit(session, {"type": "session_closed", "reason": reason})
 
-        ws.send(json.dumps({
-            "type": "response.create",
-            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
-        }, ensure_ascii=False))
 
-        while True:
+def _realtime_reader_loop(session_id):
+    session = _REALTIME_SESSIONS.get(session_id)
+    if not session:
+        return
+    ws = session["ws"]
+    conv_id = session["conv_id"]
+    cur_text_parts = []
+    has_text_delta = False
+    audio_b64_parts = []
+    try:
+        while session.get("active"):
             msg = ws.recv()
             if not msg:
-                break
+                continue
             try:
                 ev = json.loads(msg)
             except json.JSONDecodeError:
                 continue
             typ = ev.get("type") or ""
-            if typ == "response.audio_transcript.delta":
-                delta = (ev.get("delta") or "").strip()
+            if typ in ("response.output_text.delta", "response.text.delta"):
+                delta = ev.get("delta") or ""
                 if delta:
-                    full_transcript.append(delta)
-                    yield f"data: {json.dumps({'content': delta}, ensure_ascii=False)}\n\n"
-            elif typ == "response.audio.delta":
+                    has_text_delta = True
+                    cur_text_parts.append(delta)
+                    _realtime_emit(session, {"type": "text_delta", "delta": delta})
+            elif typ == "response.audio_transcript.delta":
+                # 某些场景文本增量可能走音频转写通道，作为回退补齐
+                if has_text_delta:
+                    continue
+                delta = ev.get("delta") or ""
+                if delta:
+                    cur_text_parts.append(delta)
+                    _realtime_emit(session, {"type": "text_delta", "delta": delta})
+            elif typ in ("response.audio.delta", "response.output_audio.delta"):
                 delta_b64 = ev.get("delta") or ""
                 if delta_b64:
-                    yield f"data: {json.dumps({'audio': delta_b64}, ensure_ascii=False)}\n\n"
+                    audio_b64_parts.append(delta_b64)
+                    _realtime_emit(session, {"type": "audio_delta", "audio": delta_b64})
+            elif typ == "response.done":
+                ai_content = "".join(cur_text_parts).strip() or "（无回复）"
+                cur_text_parts = []
+                has_text_delta = False
+                audio_url = None
+                audio_name = None
+                merged_b64 = "".join(audio_b64_parts).strip()
+                audio_b64_parts = []
+                if merged_b64:
+                    try:
+                        raw_audio = base64.b64decode(merged_b64, validate=False)
+                        if raw_audio:
+                            wav_bytes = _decoded_omni_audio_to_wav_bytes(raw_audio)
+                            if wav_bytes:
+                                audio_url, audio_name = _save_assistant_audio_file(wav_bytes, conv_id)
+                    except Exception:
+                        pass
+                if conv_id is not None:
+                    db.create_message(conv_id, "assistant", ai_content, "text", audio_url, audio_name)
+                    db.update_conversation_last_message(conv_id, ai_content)
+                _realtime_emit(session, {"type": "response_done"})
             elif typ == "error":
                 err = ev.get("error") or {}
                 msg = err.get("message") or ev.get("message") or str(ev.get("code", "unknown"))
-                yield f"data: {json.dumps({'error': msg}, ensure_ascii=False)}\n\n"
+                _realtime_emit(session, {"type": "error", "error": msg})
                 break
-            elif typ == "response.done":
-                break
-        ai_content = "".join(full_transcript).strip() or "（无回复）"
-        db.create_message(conv_id, "assistant", ai_content, "text", None, None)
-        db.update_conversation_last_message(conv_id, ai_content)
-        yield "data: [DONE]\n\n"
     except Exception as e:
-        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        _realtime_emit(session, {"type": "error", "error": str(e)})
     finally:
+        _close_realtime_session(session_id, "upstream_closed")
+
+
+def _create_realtime_upstream():
+    """连接 DashScope Realtime 并初始化 session。"""
+    url = f"{REALTIME_WS_URL.rstrip('/')}?model={REALTIME_MODEL}"
+    headers = [f"Authorization: Bearer {REALTIME_API_KEY}"]
+    ws = websocket.create_connection(
+        url,
+        header=headers,
+        timeout=_REALTIME_CONNECT_TIMEOUT_SEC,
+    )
+    ws.settimeout(_REALTIME_RECV_TIMEOUT_SEC)
+    session_event = {
+        "type": "session.update",
+        "event_id": f"evt_{uuid.uuid4().hex[:24]}",
+        "session": {
+            "modalities": ["audio", "text"],
+            "voice": "Cherry",
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "turn_detection": {
+                "type": "server_vad",
+                "silence_duration_ms": 700,
+                "prefix_padding_ms": 240,
+                "create_response": True,
+            },
+            "instructions": _build_realtime_instructions(),
+        },
+    }
+    ws.send(json.dumps(session_event, ensure_ascii=False))
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        msg = ws.recv()
+        if not msg:
+            continue
         try:
-            ws.close()
-        except Exception:
-            pass
+            ev = json.loads(msg)
+        except json.JSONDecodeError:
+            continue
+        typ = ev.get("type") or ""
+        if typ == "session.updated":
+            return ws
+        if typ == "error":
+            err = ev.get("error") or {}
+            detail = err.get("message") or ev.get("message") or str(ev.get("code", "unknown"))
+            raise RuntimeError(detail)
+    raise RuntimeError("实时会话初始化超时")
 
 
-@app.route("/api/chat/realtime", methods=["POST"])
-def chat_realtime():
-    """
-    实时语音对话：请求体需 conversationId、pcmBase64（16k 16bit 单声道 PCM 的 base64）。
-    返回 SSE：data: {"content": "文本片段"} 或 data: {"audio": "base64"}，结束 data: [DONE]。
-    仅当「点击数字人」开启语音时，前端发送语音消息走此接口，实现文字与语音同步输出。
-    """
+def _get_realtime_session_owned(session_id, user_id):
+    with _REALTIME_SESSIONS_LOCK:
+        session = _REALTIME_SESSIONS.get(session_id)
+    if not session:
+        return None, (jsonify({"error": "实时会话不存在或已结束"}), 404)
+    if int(session.get("user_id", -1)) != int(user_id):
+        return None, (jsonify({"error": "无权访问该实时会话"}), 403)
+    return session, None
+
+
+@app.route("/api/chat/realtime/session/start", methods=["POST"])
+def realtime_session_start():
     user_id, err_res = _require_auth()
     if err_res:
         return err_res
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        conv_id_raw = data.get("conversationId") or data.get("conversation_id")
-        pcm_base64 = (data.get("pcmBase64") or "").strip()
-        if conv_id_raw is None:
-            return jsonify({"error": "缺少 conversationId"}), 400
-        if not pcm_base64:
-            return jsonify({"error": "缺少 pcmBase64（16k 16bit 单声道 PCM 的 base64）"}), 400
-        try:
-            conv_id = int(conv_id_raw)
-        except (TypeError, ValueError):
-            return jsonify({"error": "conversationId 无效"}), 400
-        owner = db.get_conversation_owner(conv_id)
-        if owner is None or owner != int(user_id):
-            return jsonify({"error": "会话不存在或无权访问"}), 404
-
-        user_content = "[语音]"
-        db.create_message(conv_id, "user", user_content, "voice", None, None)
-        db.update_conversation_last_message(conv_id, user_content)
-
-        return Response(
-            _realtime_stream(conv_id, user_id, pcm_base64),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
+        ws = _create_realtime_upstream()
+        session_id = f"rt_{uuid.uuid4().hex}"
+        session = {
+            "id": session_id,
+            "conv_id": None,
+            "user_id": int(user_id),
+            "ws": ws,
+            "queue": queue.Queue(maxsize=2048),
+            "active": True,
+        }
+        with _REALTIME_SESSIONS_LOCK:
+            _REALTIME_SESSIONS[session_id] = session
+        worker = threading.Thread(
+            target=_realtime_reader_loop,
+            args=(session_id,),
+            daemon=True,
+            name=f"realtime-reader-{session_id[:8]}",
         )
+        worker.start()
+        return jsonify({"sessionId": session_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ---------- 豆包 TTS 语音合成（数字人发声） ----------
-
-
-@app.route("/api/tts", methods=["POST"])
-def tts():
-    """
-    文本转语音，调用豆包语音合成大模型 HTTP V1 接口。
-    请求体: { "text": "要合成的文本" }，返回 mp3 音频字节。
-    """
+@app.route("/api/chat/realtime/session/<session_id>/audio", methods=["POST"])
+def realtime_session_audio(session_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    session, err = _get_realtime_session_owned(session_id, user_id)
+    if err:
+        return err
     try:
         data = request.get_json(force=True, silent=True) or {}
-        text = (data.get("text") or "").strip()
-        if not text:
-            return jsonify({"error": "缺少 text 参数"}), 400
-        if len(text.encode("utf-8")) > 1024:
-            return jsonify({"error": "文本过长，最长支持约 1000 字节"}), 400
-
-        speed = float(data.get("speed_ratio", 1.0) or 1.0)
-        speed = max(0.1, min(2.0, speed))
-
-        payload = {
-            "app": {
-                "appid": DOUBAO_TTS_APP_ID,
-                "token": DOUBAO_TTS_ACCESS_TOKEN,
-                "cluster": DOUBAO_TTS_CLUSTER or "volcano_tts",
-            },
-            "user": {"uid": "wisdom-star"},
-            "audio": {
-                "voice_type": data.get("voice_type") or DOUBAO_TTS_DEFAULT_VOICE,
-                "encoding": "mp3",
-                "speed_ratio": speed,
-                "volume_ratio": 1.0,
-            },
-            "request": {
-                "reqid": str(uuid.uuid4()),
-                "text": text,
-                "operation": "query",
-            },
-        }
-        if DOUBAO_TTS_RESOURCE_ID:
-            payload["request"]["model"] = DOUBAO_TTS_RESOURCE_ID
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer;{DOUBAO_TTS_ACCESS_TOKEN}",
-        }
-        if DOUBAO_TTS_RESOURCE_ID:
-            headers["X-Api-Resource-Id"] = DOUBAO_TTS_RESOURCE_ID
-        resp = requests.post(
-            DOUBAO_TTS_URL,
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        code = result.get("code", 0)
-        if code != 3000:
-            msg = result.get("message") or f"code={code}"
-            return jsonify({"error": f"TTS 合成失败: {msg}"}), 502
-        b64_data = result.get("data") or ""
-        if not b64_data:
-            return jsonify({"error": "TTS 返回音频为空"}), 502
-        audio_bytes = base64.b64decode(b64_data)
-        return Response(audio_bytes, mimetype="audio/mpeg")
-    except requests.RequestException as e:
-        err = str(e)
-        if hasattr(e, "response") and e.response is not None:
-            try:
-                j = e.response.json()
-                err = j.get("message") or j.get("error") or err
-            except Exception:
-                err = (getattr(e.response, "text", None) or err)[:300]
-        return jsonify({"error": f"TTS 请求失败: {err}"}), 502
+        audio_b64 = (data.get("audio") or "").strip()
+        if not audio_b64:
+            return jsonify({"error": "缺少 audio（16k 16bit mono pcm 的 base64）"}), 400
+        session["ws"].send(json.dumps({
+            "type": "input_audio_buffer.append",
+            "event_id": f"evt_{uuid.uuid4().hex[:24]}",
+            "audio": audio_b64,
+        }, ensure_ascii=False))
+        return jsonify({"ok": True})
     except Exception as e:
+        _realtime_emit(session, {"type": "error", "error": str(e)})
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chat/realtime/session/<session_id>/events", methods=["GET"])
+def realtime_session_events(session_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    session, err = _get_realtime_session_owned(session_id, user_id)
+    if err:
+        return err
+
+    def generate():
+        while True:
+            try:
+                payload = session["queue"].get(timeout=_REALTIME_EVENT_IDLE_TIMEOUT_SEC)
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                if payload.get("type") == "session_closed":
+                    break
+            except queue.Empty:
+                # SSE 心跳，防止代理层断开空闲连接
+                yield ":\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.route("/api/chat/realtime/session/<session_id>/stop", methods=["POST"])
+def realtime_session_stop(session_id):
+    user_id, err_res = _require_auth()
+    if err_res:
+        return err_res
+    session, err = _get_realtime_session_owned(session_id, user_id)
+    if err:
+        return err
+    _close_realtime_session(session.get("id") or session_id, "client_stopped")
+    return jsonify({"ok": True})
 
 
 # ---------- 认证：注册 / 登录 / 登出 / 当前用户 ----------

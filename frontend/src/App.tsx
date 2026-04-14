@@ -10,6 +10,7 @@ const MainLayout = lazy(() => import('@/layouts/MainLayout'))
 const LoginPage = lazy(() => import('@/pages/LoginPage'))
 const RegisterPage = lazy(() => import('@/pages/RegisterPage'))
 const ChatPage = lazy(() => import('@/pages/ChatPage'))
+const RealtimeVoiceWindow = lazy(() => import('@/pages/RealtimeVoiceWindow'))
 const ProfilePage = lazy(() => import('@/pages/ProfilePage'))
 const FaceMonitorPage = lazy(() => import('@/pages/FaceMonitorPage'))
 
@@ -76,6 +77,11 @@ function App() {
             <Route path="profile" element={<ProfilePage />} />
             <Route path="face-monitor" element={<FaceMonitorPage />} />
           </Route>
+
+          <Route
+            path="/realtime-window"
+            element={<RealtimeVoiceWindow />}
+          />
 
           <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />

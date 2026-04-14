@@ -18,6 +18,8 @@ interface DigitalHumanProps {
   onClick?: () => void
   /** 是否处于实时对话模式，用于展示提示文案 */
   realtimeMode?: boolean
+  /** 纯净模式：仅渲染数字人，不显示底部文案 */
+  minimal?: boolean
   className?: string
 }
 
@@ -71,6 +73,7 @@ export default function DigitalHuman({
   bodyMotion = true,
   onClick,
   realtimeMode = false,
+  minimal = false,
   className,
 }: DigitalHumanProps) {
   const [blink, setBlink] = useState(false)
@@ -276,13 +279,17 @@ export default function DigitalHuman({
           </g>
         </g>
       </svg>
-      <p className="mt-1 sm:mt-2 text-xs sm:text-sm text-gray-500 dark:text-gray-400">
-        {realtimeMode ? '实时对话已开启 · 回复将语音播报' : '数字人助手'}
-      </p>
-      {onClick && !realtimeMode && (
-        <p className="mt-0.5 text-[11px] sm:text-xs text-primary-500 dark:text-primary-400">
-          点击开启实时对话
-        </p>
+      {!minimal && (
+        <>
+          <p className="mt-1 sm:mt-2 text-xs sm:text-sm text-gray-500 dark:text-gray-400">
+            {realtimeMode ? '实时对话已开启 · 回复将语音播报' : '数字人助手'}
+          </p>
+          {onClick && !realtimeMode && (
+            <p className="mt-0.5 text-[11px] sm:text-xs text-primary-500 dark:text-primary-400">
+              点击开启实时对话
+            </p>
+          )}
+        </>
       )}
     </div>
   )

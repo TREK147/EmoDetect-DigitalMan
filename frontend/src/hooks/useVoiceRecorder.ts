@@ -94,7 +94,7 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
   // 停止所有并清理
   const stopAll = useCallback(() => {
     // 停止录音
-    if (mediaRecorderRef.current && isRecording) {
+    if (mediaRecorderRef.current) {
       try {
         mediaRecorderRef.current.state !== 'inactive' && mediaRecorderRef.current.stop()
       } catch (_) {}
@@ -140,7 +140,7 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
     }
     setIsPlaying(false)
     setPlaybackProgress(0)
-  }, [isRecording])
+  }, [])
 
   // 开始录音
   const startRecording = useCallback(async () => {
@@ -152,30 +152,51 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
       setTranscript('')
       setInterimTranscript('')
 
-      // MediaRecorder 录制
+      // MediaRecorder 录制（须传入 mimeType，否则部分浏览器默认类型与 chunks 不一致）
       const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
-        : 'audio/webm'
-      const recorder = new MediaRecorder(stream)
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : ''
+      if (typeof MediaRecorder === 'undefined') {
+        stream.getTracks().forEach((t) => t.stop())
+        streamRef.current = null
+        throw new Error('当前浏览器不支持 MediaRecorder 录音')
+      }
+      const recorder =
+        mime && MediaRecorder.isTypeSupported(mime)
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream)
       mediaRecorderRef.current = recorder
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data)
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
       }
       recorder.onstop = () => {
         if (chunksRef.current.length) {
-          const blob = new Blob(chunksRef.current, { type: mime })
+          const blobType = recorder.mimeType || mime || 'audio/webm'
+          const blob = new Blob(chunksRef.current, { type: blobType })
           setRecordedBlob(blob)
           const prev = recordedUrl
           if (prev) URL.revokeObjectURL(prev)
           setRecordedUrl(URL.createObjectURL(blob))
         }
       }
-      recorder.start(100)
-      setIsRecording(true)
+      // 使用分片间隔，确保各浏览器持续产出 ondataavailable；无参 start() 在部分环境下收尾数据不可靠
+      try {
+        recorder.start(250)
+      } catch {
+        try {
+          recorder.start(100)
+        } catch {
+          recorder.start()
+        }
+      }
 
       const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)()
       audioContextRef.current = ctx
       const source = ctx.createMediaStreamSource(stream)
+      // 仅在 MediaRecorder + 音频图已成功建立后再标为录制中，避免后续步骤抛错时 catch 里关麦导致「从未进入录制态」或秒关麦克风
+      setIsRecording(true)
 
       // 优先使用 Web Worker 处理波形，减轻主线程负担
       try {
@@ -232,41 +253,94 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
         updateWaveform()
       }
 
-      // 语音识别（若支持）
+      // 语音识别（可选）：start() 在部分浏览器会抛错或与 MediaRecorder 争用麦克风，绝不能拖垮主录音流程
       const SpeechRecognition = window.SpeechRecognition ?? window.webkitSpeechRecognition
       if (SpeechRecognition) {
-        const recognition = new SpeechRecognition()
-        recognition.continuous = true
-        recognition.interimResults = true
-        recognition.lang = 'zh-CN'
-        recognition.onresult = (e: SpeechRecognitionEvent) => {
-          let interim = ''
-          let final = ''
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            const r = e.results[i]
-            const t = r[0].transcript
-            if (r.isFinal) final += t
-            else interim += t
+        try {
+          const recognition = new SpeechRecognition()
+          recognition.continuous = true
+          recognition.interimResults = true
+          recognition.lang = 'zh-CN'
+          recognition.onresult = (e: SpeechRecognitionEvent) => {
+            let interim = ''
+            let final = ''
+            for (let i = e.resultIndex; i < e.results.length; i++) {
+              const r = e.results[i]
+              const t = r[0].transcript
+              if (r.isFinal) final += t
+              else interim += t
+            }
+            if (final) setTranscript((prev) => prev + final)
+            setInterimTranscript(interim)
           }
-          if (final) setTranscript((prev) => prev + final)
-          setInterimTranscript(interim)
+          recognition.onend = () => setIsListening(false)
+          recognition.onerror = () => setIsListening(false)
+          recognitionRef.current = recognition
+          recognition.start()
+          setIsListening(true)
+        } catch {
+          recognitionRef.current = null
+          setIsListening(false)
         }
-        recognition.onend = () => setIsListening(false)
-        recognition.onerror = () => setIsListening(false)
-        recognitionRef.current = recognition
-        recognition.start()
-        setIsListening(true)
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '无法访问麦克风')
+      const message = err instanceof Error ? err.message : '无法访问麦克风'
+      setError(message)
       setIsRecording(false)
+      setIsListening(false)
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop())
+        streamRef.current = null
+      }
+      if (mediaRecorderRef.current) {
+        try {
+          if (mediaRecorderRef.current.state === 'recording') mediaRecorderRef.current.stop()
+        } catch (_) {}
+        mediaRecorderRef.current = null
+      }
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort()
+        } catch (_) {}
+        recognitionRef.current = null
+      }
+      if (scriptProcessorRef.current) {
+        try {
+          scriptProcessorRef.current.disconnect()
+        } catch (_) {}
+        scriptProcessorRef.current = null
+      }
+      if (audioContextRef.current?.state !== 'closed') {
+        try {
+          audioContextRef.current?.close()
+        } catch (_) {}
+      }
+      audioContextRef.current = null
+      analyserRef.current = null
+      throw new Error(message)
     }
   }, [recordedUrl])
 
   // 停止录音
   const stopRecording = useCallback(async (): Promise<Blob | null> => {
+    const buildBlobFromChunks = (typeHint?: string): Blob | null => {
+      const parts = [...chunksRef.current]
+      if (!parts.length) return null
+      const blob = new Blob(parts, { type: typeHint || 'audio/webm' })
+      return blob.size > 0 ? blob : null
+    }
+
+    // 用户可能在 startRecording 尚未完成（getUserMedia / start 未执行）时点「停止」，短暂等待录音器就绪
+    const deadline = Date.now() + 2500
+    while (Date.now() < deadline) {
+      const r = mediaRecorderRef.current
+      if (r && r.state !== 'inactive') break
+      await new Promise<void>((res) => setTimeout(res, 40))
+    }
+
     return new Promise((resolve) => {
       if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
+        const blob = buildBlobFromChunks(mediaRecorderRef.current?.mimeType || 'audio/webm')
         if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop())
         streamRef.current = null
         setIsRecording(false)
@@ -278,6 +352,15 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
         if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current)
         setWaveformData(Array(WAVEFORM_LENGTH).fill(0))
         setAudioLevel(0)
+        if (blob) {
+          setRecordedBlob(blob)
+          setRecordedUrl((u) => {
+            if (u) URL.revokeObjectURL(u)
+            return URL.createObjectURL(blob)
+          })
+          resolve(blob)
+          return
+        }
         resolve(null)
         return
       }
@@ -285,44 +368,73 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
       try {
         if (typeof mr.requestData === 'function') mr.requestData()
       } catch (_) {}
+      const mimeType = mr.mimeType || 'audio/webm'
       mr.onstop = () => {
-        if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop())
-        streamRef.current = null
         mediaRecorderRef.current = null
-        if (recognitionRef.current) {
-          try { recognitionRef.current.stop() } catch (_) {}
-          recognitionRef.current = null
+
+        const cleanupStreamAndUi = () => {
+          if (streamRef.current) {
+            streamRef.current.getTracks().forEach((t) => t.stop())
+            streamRef.current = null
+          }
+          if (recognitionRef.current) {
+            try {
+              recognitionRef.current.stop()
+            } catch (_) {}
+            recognitionRef.current = null
+          }
+          setIsRecording(false)
+          setIsListening(false)
+          if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current)
+          setWaveformData(Array(WAVEFORM_LENGTH).fill(0))
+          setAudioLevel(0)
+          if (scriptProcessorRef.current) {
+            try {
+              scriptProcessorRef.current.disconnect()
+            } catch (_) {}
+            scriptProcessorRef.current = null
+          }
+          if (audioContextRef.current?.state !== 'closed') {
+            try {
+              audioContextRef.current?.close()
+            } catch (_) {}
+          }
+          audioContextRef.current = null
+          analyserRef.current = null
         }
-        setIsRecording(false)
-        setIsListening(false)
-        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current)
-        setWaveformData(Array(WAVEFORM_LENGTH).fill(0))
-        setAudioLevel(0)
-        const mimeType = mr.mimeType || 'audio/webm'
-        const chunksSnapshot = [...chunksRef.current]
-        const buildBlob = () =>
-          chunksSnapshot.length ? new Blob(chunksSnapshot, { type: mimeType }) : null
-        const resolveBlob = (blob: Blob | null) => {
-          if (blob) {
+
+        const finish = (blob: Blob | null) => {
+          cleanupStreamAndUi()
+          if (blob && blob.size > 0) {
             setRecordedBlob(blob)
             setRecordedUrl((u) => {
               if (u) URL.revokeObjectURL(u)
               return URL.createObjectURL(blob)
             })
-          }
-          resolve(blob)
-        }
-        const delayMs = 300
-        setTimeout(() => {
-          let blob = buildBlob()
-          if (blob && blob.size > 0) {
-            resolveBlob(blob)
+            resolve(blob)
             return
           }
-          setTimeout(() => {
-            resolveBlob(buildBlob())
-          }, 250)
-        }, delayMs)
+          resolve(null)
+        }
+
+        /** 每次重试都从 chunksRef 读取：最终 ondataavailable 可能晚于 onstop；之前误用固定 snapshot 导致重试无效 */
+        const tryResolve = (attempt: number) => {
+          const blob = buildBlobFromChunks(mimeType)
+          if (blob) {
+            finish(blob)
+            return
+          }
+          // 低性能设备/浏览器上最终音频分片可能明显晚于 onstop；适当拉长等待窗口，减少误判为空
+          if (attempt < 36) {
+            setTimeout(
+              () => tryResolve(attempt + 1),
+              attempt < 8 ? 40 : attempt < 20 ? 120 : 220
+            )
+          } else {
+            finish(null)
+          }
+        }
+        queueMicrotask(() => tryResolve(0))
       }
       mr.stop()
     })

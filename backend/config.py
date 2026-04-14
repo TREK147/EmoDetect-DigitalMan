@@ -28,45 +28,59 @@ MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 # 用于生成/验证 token（生产环境请用环境变量设置随机字符串）
 SECRET_KEY = os.environ.get("SECRET_KEY", "emo-system-secret-change-in-production")
 
-# 阿里云 DashScope：文本对话用 HTTP 兼容模式，实时语音用 WebSocket
+# 阿里云 DashScope：仅认环境变量 DASHSCOPE_API_KEY（文本 HTTP 与实时 WebSocket 共用）
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+API_KEY = DASHSCOPE_API_KEY
 CHAT_API_URL = os.environ.get(
     "CHAT_API_URL",
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
 )
-API_KEY = os.environ.get(
-    "CHAT_API_KEY",
-    os.environ.get("DASHSCOPE_REALTIME_API_KEY", "sk-b14e4cee630944609d1c2caefe39dc0e"),
-)
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen3-omni-flash")
 MAX_TOKENS = int(os.environ.get("CHAT_MAX_TOKENS", "1024"))
 
-# 实时对话（数字人语音）：WebSocket，与聊天框同步输出文本+语音
+# qwen3-omni-flash 等 Omni 模型：流式对话可同时输出文本 + 音频（保存为 wav 供前端喇叭播放）
+CHAT_OMNI_VOICE = os.environ.get("CHAT_OMNI_VOICE", "Cherry")
+CHAT_OMNI_AUDIO_FORMAT = os.environ.get("CHAT_OMNI_AUDIO_FORMAT", "wav")
+# 流式接口返回的常为原始 PCM16（非 RIFF），封装 WAV 头时使用该采样率（与阿里云文档示例 24kHz 一致）
+CHAT_OMNI_SAMPLE_RATE = int(os.environ.get("CHAT_OMNI_SAMPLE_RATE", "24000"))
+
+# 对话人设（HTTP /api/chat、/api/chat/stream；可通过 CHAT_SYSTEM_PROMPT 覆盖）
+CHAT_SYSTEM_PROMPT = os.environ.get(
+    "CHAT_SYSTEM_PROMPT",
+    """你的设定：你是同学们的好朋友小Q。
+你的聊天对象：在校大学生
+语言风格：
+1.简短优先（最重要）
+每次回复控制在 1~2句话，最多不超过50字
+不主动展开背景、故事或额外信息
+不说与用户问题无关的内容
+2.自然亲切但不过度表达
+语气像朋友，但不要刻意卖萌或表演
+避免使用括号补充说明（如“（悄悄说…）”）
+不自言自语，不主动讲自己的经历，除非用户问
+3.聚焦用户当前输入
+用户说什么，就只回应那一件事
+不主动引出新话题（除非用于简单追问）
+4.建议表达方式（如需要）
+用一句简单经验或建议即可
+不展开长故事或详细过程
+5.禁止行为
+禁止编造生活细节（如“刚在图书馆…”）
+禁止过度拟人或表演型表达
+禁止输出冗长、多段内容
+""",
+)
+
+# qwen3-omni-flash-realtime：session.update 的 instructions（与上方人设一致；可用 REALTIME_SYSTEM_PROMPT 单独覆盖）
+REALTIME_SYSTEM_PROMPT = os.environ.get(
+    "REALTIME_SYSTEM_PROMPT",
+    CHAT_SYSTEM_PROMPT,
+)
+
+# 实时对话（数字人）：WebSocket qwen3-omni-flash-realtime，与聊天框同步输出文本+语音
 REALTIME_WS_URL = os.environ.get(
     "REALTIME_WS_URL",
     "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
 )
-REALTIME_API_KEY = os.environ.get(
-    "REALTIME_API_KEY",
-    "sk-b14e4cee630944609d1c2caefe39dc0e",
-)
+REALTIME_API_KEY = DASHSCOPE_API_KEY
 REALTIME_MODEL = os.environ.get("REALTIME_MODEL", "qwen3-omni-flash-realtime")
-
-# 豆包语音合成 TTS（用于数字人发声）
-# 这些值来自你在火山引擎控制台申请的 AppID / Token
-DOUBAO_TTS_APP_ID = os.environ.get("DOUBAO_TTS_APP_ID", "6750944620")
-DOUBAO_TTS_ACCESS_TOKEN = os.environ.get(
-    "DOUBAO_TTS_ACCESS_TOKEN", "hSASGpCZb2Ol_fKNYRqY6hXwJsfPXFQx"
-)
-DOUBAO_TTS_CLUSTER = os.environ.get("DOUBAO_TTS_CLUSTER", "volcano_tts")
-DOUBAO_TTS_URL = os.environ.get(
-    "DOUBAO_TTS_URL", "https://openspeech.bytedance.com/api/v1/tts"
-)
-# 资源 ID：留空 = 使用「语音合成大模型-字符版」默认资源（音色用控制台 *_moon_bigtts）
-# 填 "seed-tts-1.0" = 使用 Seed TTS 1.0（需在控制台开通对应资源）
-DOUBAO_TTS_RESOURCE_ID = os.environ.get("DOUBAO_TTS_RESOURCE_ID", "")
-# 默认音色（控制台「音色详情」里的 Voice_type）
-# 可选示例：zh_female_meilinvyou_moon_bigtts 魅力女友, zh_male_haoyuxiaoge_moon_bigtts 浩宇小哥,
-# zh_male_shaonianzixin_moon_bigtts 少年梓辛, zh_female_daimengchuanmei_moon_bigtts 呆萌川妹
-DOUBAO_TTS_DEFAULT_VOICE = os.environ.get(
-    "DOUBAO_TTS_DEFAULT_VOICE", "zh_male_haoyuxiaoge_moon_bigtts"
-)
