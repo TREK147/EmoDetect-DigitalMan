@@ -41,3 +41,14 @@ Thumbs.db
 
 # EmotiEffLib：不纳入仓库，使用 pip install emotiefflib + 运行时下载模型到 ~/.emotiefflib
 EmotiEffLib/
+
+.env
+**/.env
+.venv/
+**/.venv/
+node_modules/
+**/node_modules/
+__pycache__/
+**/__pycache__/
+dist/
+**/dist/
